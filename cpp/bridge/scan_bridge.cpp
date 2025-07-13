@@ -40,6 +40,7 @@ namespace {
 #include "../scan/bb_base.hpp"
 #include "../scan/bb_comp.hpp"
 #include "../scan/bb_index.hpp"
+#include "../scan/fen.hpp"  // DODANY BRAKUJĄCY INCLUDE
 
 // Forward declarations
 static void hub_loop_bridge();

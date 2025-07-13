@@ -1,13 +1,13 @@
 {
     "name": "dawikk-scan",
-    "version": "0.9.82",
+    "version": "0.5.0",
     "description": "Library to run Stockfish Chess Engine on all mobile platforms",
     "main": "src/index.tsx",
     "types": "src/index.tsx",
     "scripts": {
       "test": "echo \"Error: no test specified\" && exit 1"
     },
-    "podspec": "./dawikk-stockfish.podspec",
+    "podspec": "./dawikk-scan.podspec",
     "keywords": [
       "react-native",
       "scan",
@@ -18,14 +18,14 @@
     ],
     "repository": {
       "type": "git",
-      "url": "git+https://github.com/DawiQ/dawikk-stock"
+      "url": "git+https://github.com/DawiQ/dawikk-scan"
     },
     "author": "Dawikk <dawikk.apps@gmail.com> (https://github.com/DawiQ)",
     "license": "MIT",
     "bugs": {
-      "url": "https://github.com/DawiQ/dawikk-stock/issues"
+      "url": "https://github.com/DawiQ/dawikk-scan/issues"
     },
-    "homepage": "https://github.com/DawiQ/dawikk-stock#readme",
+    "homepage": "https://github.com/DawiQ/dawikk-scan#readme",
     "publishConfig": {
       "registry": "https://registry.npmjs.org/"
     },

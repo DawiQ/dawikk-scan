@@ -1,7 +1,7 @@
 {
     "name": "dawikk-scan",
-    "version": "0.5.0",
-    "description": "Library to run Stockfish Chess Engine on all mobile platforms",
+    "version": "0.5.1",
+    "description": "Library to run Scan Draughts Engine on all mobile platforms",
     "main": "src/index.tsx",
     "types": "src/index.tsx",
     "scripts": {

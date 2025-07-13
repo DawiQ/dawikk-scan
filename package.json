@@ -1,0 +1,50 @@
+{
+    "name": "dawikk-scan",
+    "version": "0.9.82",
+    "description": "Library to run Stockfish Chess Engine on all mobile platforms",
+    "main": "src/index.tsx",
+    "types": "src/index.tsx",
+    "scripts": {
+      "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "podspec": "./dawikk-stockfish.podspec",
+    "keywords": [
+      "react-native",
+      "scan",
+      "draughts",
+      "hub",
+      "ios",
+      "android"
+    ],
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/DawiQ/dawikk-stock"
+    },
+    "author": "Dawikk <dawikk.apps@gmail.com> (https://github.com/DawiQ)",
+    "license": "MIT",
+    "bugs": {
+      "url": "https://github.com/DawiQ/dawikk-stock/issues"
+    },
+    "homepage": "https://github.com/DawiQ/dawikk-stock#readme",
+    "publishConfig": {
+      "registry": "https://registry.npmjs.org/"
+    },
+    "peerDependencies": {
+      "react": "*",
+      "react-native": "*"
+    },
+    "devDependencies": {
+      "react": "18.2.0",
+      "react-native": "0.72.7",
+      "@types/react": "^18.2.0",
+      "@types/react-native": "^0.72.0"
+    },
+    "codegenConfig": {
+      "name": "RNScanSpec",
+      "type": "modules",
+      "jsSrcsDir": "src",
+      "android": {
+        "javaPackageName": "com.dawikk.scan"
+      }
+    }
+  }

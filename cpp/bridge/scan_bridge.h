@@ -5,15 +5,12 @@
 extern "C" {
 #endif
 
-// Public API functions - podobne do stockfish_bridge.h ale dla Scan
+// Public API functions
 int scan_init(void);
 int scan_main(void);
 const char* scan_stdout_read(void);
 int scan_stdin_write(const char* data);
-
-// Dodatkowe funkcje specyficzne dla warcabów
-int scan_set_variant(const char* variant); // "normal", "frisian", etc.
-const char* scan_get_position_format(void); // Zwraca format pozycji warcabowej
+void scan_shutdown(void);
 
 #ifdef __cplusplus
 }

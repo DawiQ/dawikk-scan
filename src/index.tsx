@@ -1,103 +1,111 @@
 import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 
-// Typy specyficzne dla warcabów
-export interface DraughtsPosition {
-  white: number[];
-  black: number[];
-  whiteKings: number[];
-  blackKings: number[];
-  sideToMove: 'white' | 'black';
-}
-
-export interface DraughtsMove {
-  from: number;
-  to: number;
-  captures?: number[];
-  promotion?: boolean;
-}
-
-export interface DraughtsAnalysisData {
-  type: 'info' | 'done' | 'error' | 'ready';
-  depth?: number;
-  score?: number;
-  move?: string;
-  line?: string;
-  ponder?: string;
-  variant?: string;
-  nodes?: number;
-  time?: number;
-  pv?: string;
-  status?: string;
-  error?: string;
-}
-
-export interface DraughtsAnalysisOptions {
+// Type definitions for draughts/checkers
+export interface AnalysisOptions {
   depth?: number;
   movetime?: number;
-  variant?: 'normal' | 'frisian' | 'killer' | 'losing' | 'bt';
   nodes?: number;
+  infinite?: boolean;
 }
 
-// Konfiguracja podobna do Stockfisha ale dla warcabów
+export interface AnalysisData {
+  type: 'info' | 'bestmove';
+  depth?: number;
+  score?: number;
+  bestMove?: string;
+  line?: string;
+  move?: string;
+  nodes?: number;
+  time?: number;
+  nps?: number;
+  fen?: string;
+  [key: string]: any;
+}
+
+export interface BestMoveData {
+  type: 'bestmove';
+  move: string;
+  ponder?: string;
+}
+
+// Configuration for event throttling and filtering
 export interface ScanConfig {
+  // Throttling intervals (in ms)
   throttling: {
-    analysisInterval: number;
-    messageInterval: number;
-    commandTimeout: number;
+    analysisInterval: number;  // Time between analysis event emissions
+    messageInterval: number;   // Time between message event emissions
   };
+  // Event emission control
   events: {
-    emitMessage: boolean;
-    emitAnalysis: boolean;
-    emitBestMove: boolean;
-    emitErrors: boolean;
+    emitMessage: boolean;      // Whether to emit raw message events
+    emitAnalysis: boolean;     // Whether to emit analysis events
+    emitBestMove: boolean;     // Whether to emit bestMove events
   };
 }
 
+type MessageListener = (message: string) => void;
+type AnalysisListener = (data: AnalysisData) => void;
+type BestMoveListener = (data: BestMoveData) => void;
+
+// Default configuration
 const DEFAULT_CONFIG: ScanConfig = {
   throttling: {
-    analysisInterval: 100,
-    messageInterval: 100,
-    commandTimeout: 5000,
+    analysisInterval: 100,   // Default: 100ms between analysis events
+    messageInterval: 100,    // Default: 100ms between message events
   },
   events: {
     emitMessage: true,
     emitAnalysis: true,
     emitBestMove: true,
-    emitErrors: true,
   }
 };
 
+// Linking error handling
 const LINKING_ERROR =
   `The package 'dawikk-scan' doesn't seem to be linked. Make sure: \n\n` +
   Platform.select({ ios: "- You have run 'pod install'\n", default: '' }) +
   '- You rebuilt the app after installing the package\n' +
   '- You are not using Expo Go\n';
 
+// Get the native module
 const ScanModule = NativeModules.RNScanModule
   ? NativeModules.RNScanModule
-  : new Proxy({}, {
-      get() {
-        throw new Error(LINKING_ERROR);
-      },
-    });
+  : new Proxy(
+      {},
+      {
+        get() {
+          throw new Error(LINKING_ERROR);
+        },
+      }
+    );
 
+// Create event emitter
 export const ScanEventEmitter = new NativeEventEmitter(ScanModule);
 
 class Scan {
+  // Class properties
   engineInitialized: boolean;
+  private listeners: MessageListener[];
+  private analysisListeners: AnalysisListener[];
+  private bestMoveListeners: BestMoveListener[];
+  private outputSubscription: any;
+  private analysisSubscription: any;
+  
+  // Throttling properties
   private config: ScanConfig;
-  private currentVariant: string;
-  private pendingCommands: Map<string, { resolve: Function; reject: Function; timeout: ReturnType<typeof setTimeout> }>;
-  private commandId: number;
-  private _isAnalyzing: boolean;
+  private messageBuffer: string[] = [];
+  private analysisBuffer: AnalysisData[] = [];
+  private lastBestMove: BestMoveData | null = null;
+  private messageThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  private analysisThrottleTimer: ReturnType<typeof setTimeout> | null = null;
   
   constructor(config?: Partial<ScanConfig>) {
     this.engineInitialized = false;
-    this.currentVariant = 'normal';
-    this.pendingCommands = new Map();
-    this.commandId = 0;
-    this._isAnalyzing = false;
+    this.listeners = [];
+    this.analysisListeners = [];
+    this.bestMoveListeners = [];
     
+    // Merge provided config with defaults
     this.config = {
       ...DEFAULT_CONFIG,
       throttling: {
@@ -109,458 +117,361 @@ class Scan {
         ...(config?.events || {})
       }
     };
-
-    // Setup error handling
-    this.setupEventListeners();
+    
+    // Bind methods
+    this.init = this.init.bind(this);
+    this.sendCommand = this.sendCommand.bind(this);
+    this.shutdown = this.shutdown.bind(this);
+    this.addMessageListener = this.addMessageListener.bind(this);
+    this.addAnalysisListener = this.addAnalysisListener.bind(this);
+    this.addBestMoveListener = this.addBestMoveListener.bind(this);
+    this.removeMessageListener = this.removeMessageListener.bind(this);
+    this.removeAnalysisListener = this.removeAnalysisListener.bind(this);
+    this.removeBestMoveListener = this.removeBestMoveListener.bind(this);
+    this.handleOutput = this.handleOutput.bind(this);
+    this.handleAnalysisOutput = this.handleAnalysisOutput.bind(this);
+    this.emitThrottledMessages = this.emitThrottledMessages.bind(this);
+    this.emitThrottledAnalysis = this.emitThrottledAnalysis.bind(this);
+    this.setConfig = this.setConfig.bind(this);
+    
+    // Set up event subscriptions
+    this.outputSubscription = ScanEventEmitter.addListener(
+      'scan-output',
+      this.handleOutput
+    );
+    
+    this.analysisSubscription = ScanEventEmitter.addListener(
+      'scan-analyzed-output',
+      this.handleAnalysisOutput
+    );
   }
-
-  private setupEventListeners(): void {
-    ScanEventEmitter.addListener('scan-error', (error: any) => {
-      console.error('Scan engine error:', error);
-      if (this.config.events.emitErrors) {
-        // Reject pending commands on error
-        this.pendingCommands.forEach(({ reject }) => {
-          reject(new Error(error.error || 'Unknown engine error'));
-        });
-        this.pendingCommands.clear();
-      }
-    });
-
-    ScanEventEmitter.addListener('scan-ready', (status: any) => {
-      console.log('Scan engine status:', status);
-    });
-  }
-
+  
   /**
-   * Inicjalizuje silnik Scan z określonym wariantem warcabów
+   * Updates the Scan configuration.
+   * @param config Partial configuration to update
    */
-  async init(variant: string = 'normal'): Promise<boolean> {
+  setConfig(config: Partial<ScanConfig>): void {
+    this.config = {
+      ...this.config,
+      throttling: {
+        ...this.config.throttling,
+        ...(config.throttling || {})
+      },
+      events: {
+        ...this.config.events,
+        ...(config.events || {})
+      }
+    };
+  }
+  
+  /**
+   * Initializes the Scan engine.
+   * @returns Promise resolved as true if initialization succeeded.
+   */
+  async init(): Promise<boolean> {
     if (this.engineInitialized) {
       return true;
     }
-
+    
     try {
-      console.log(`Initializing Scan engine with variant: ${variant}`);
-      
-      await ScanModule.initEngine(variant);
+      await ScanModule.initEngine();
       this.engineInitialized = true;
-      this.currentVariant = variant;
-      
-      // Poczekaj na gotowość silnika
-      await this.waitForEngineReady(3000);
-      
-      console.log('Scan engine initialized successfully');
       return true;
     } catch (error) {
       console.error('Failed to initialize Scan engine:', error);
-      this.engineInitialized = false;
       return false;
     }
   }
-
+  
   /**
-   * Czeka na gotowość silnika
-   */
-  private async waitForEngineReady(timeout: number = 5000): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        subscription.remove();
-        reject(new Error('Timeout waiting for engine ready'));
-      }, timeout);
-
-      const subscription = ScanEventEmitter.addListener('scan-ready', (status: any) => {
-        if (status.status === 'initialized' || status.status === 'ready') {
-          clearTimeout(timer);
-          subscription.remove();
-          resolve();
-        }
-      });
-    });
-  }
-
-  /**
-   * Wysyła komendę Hub protocol do silnika z timeout
+   * Sends a HUB command to the Scan engine.
+   * @param command HUB command to send.
+   * @returns Promise resolved as true if the command was sent.
    */
   async sendCommand(command: string): Promise<boolean> {
     if (!this.engineInitialized) {
       await this.init();
     }
-
+    
     try {
-      const result = await this.sendCommandWithTimeout(command, this.config.throttling.commandTimeout);
-      return result;
+      return await ScanModule.sendCommand(command);
     } catch (error) {
       console.error('Failed to send command to Scan:', error);
       return false;
     }
   }
-
+  
   /**
-   * Wysyła komendę z timeout
-   */
-  private async sendCommandWithTimeout(command: string, timeout: number): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`Command timeout: ${command}`));
-      }, timeout);
-
-      ScanModule.sendCommand(command)
-        .then((result: boolean) => {
-          clearTimeout(timer);
-          resolve(result);
-        })
-        .catch((error: any) => {
-          clearTimeout(timer);
-          reject(error);
-        });
-    });
-  }
-
-  /**
-   * Czeka na odpowiedź silnika
-   */
-  private async waitForResponse(expectedResponse: string | string[], timeout: number = 2000): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        subscription.remove();
-        reject(new Error(`Timeout waiting for response: ${expectedResponse}`));
-      }, timeout);
-
-      const subscription = ScanEventEmitter.addListener('scan-output', (message: string) => {
-        const responses = Array.isArray(expectedResponse) ? expectedResponse : [expectedResponse];
-        
-        for (const response of responses) {
-          if (message.includes(response)) {
-            clearTimeout(timer);
-            subscription.remove();
-            resolve(message);
-            return;
-          }
-        }
-      });
-    });
-  }
-
-  /**
-   * Zatrzymuje analizę
-   */
-  async stopAnalysis(): Promise<void> {
-    if (this._isAnalyzing) {
-      await this.sendCommand('stop');
-      this._isAnalyzing = false;
-    }
-  }
-
-  /**
-   * Analizuje pozycję warcabową używając Hub protocol
-   */
-  async analyzePosition(position: string, options: DraughtsAnalysisOptions = {}): Promise<void> {
-    if (this._isAnalyzing) {
-      await this.stopAnalysis();
-    }
-
-    const { depth = 15, movetime, variant = this.currentVariant, nodes } = options;
-
-    try {
-      console.log(`Starting analysis of position: ${position}`);
-      
-      // Inicjalizacja Hub protocol
-      await this.sendCommand('hub');
-      await this.waitForResponse(['wait', 'ready'], 2000);
-      
-      // Inicjalizuj silnik
-      await this.sendCommand('init');
-      await this.waitForResponse('ready', 2000);
-      
-      // Ustaw wariant jeśli różny
-      if (variant !== this.currentVariant) {
-        await this.sendCommand(`set-param name=variant value=${variant}`);
-        this.currentVariant = variant;
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-
-      // Ustaw pozycję
-      await this.sendCommand(`pos pos=${position}`);
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // Ustaw poziom analizy
-      let levelCommand = `level depth=${depth}`;
-      if (movetime) levelCommand += ` move-time=${movetime}`;
-      if (nodes) levelCommand += ` nodes=${nodes}`;
-      
-      await this.sendCommand(levelCommand);
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // Rozpocznij analizę
-      this._isAnalyzing = true;
-      await this.sendCommand('go analyze=true');
-      
-      console.log('Analysis started successfully');
-    } catch (error) {
-      console.error('Analysis failed:', error);
-      this._isAnalyzing = false;
-      throw error;
-    }
-  }
-
-  /**
-   * Pobiera najlepszy ruch dla pozycji
-   */
-  async getBestMove(position: string, options: DraughtsAnalysisOptions = {}): Promise<void> {
-    if (this._isAnalyzing) {
-      await this.stopAnalysis();
-    }
-
-    const { depth = 12, movetime = 1000, variant = this.currentVariant, nodes } = options;
-
-    try {
-      console.log(`Getting best move for position: ${position}`);
-      
-      await this.sendCommand('hub');
-      await this.waitForResponse(['wait', 'ready'], 2000);
-      
-      await this.sendCommand('init');
-      await this.waitForResponse('ready', 2000);
-      
-      if (variant !== this.currentVariant) {
-        await this.sendCommand(`set-param name=variant value=${variant}`);
-        this.currentVariant = variant;
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-
-      await this.sendCommand(`pos pos=${position}`);
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      let levelCommand = `level depth=${depth}`;
-      if (movetime) levelCommand += ` move-time=${movetime}`;
-      if (nodes) levelCommand += ` nodes=${nodes}`;
-      
-      await this.sendCommand(levelCommand);
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      this._isAnalyzing = true;
-      await this.sendCommand('go think=true');
-      
-      console.log('Best move search started');
-    } catch (error) {
-      console.error('Best move search failed:', error);
-      this._isAnalyzing = false;
-      throw error;
-    }
-  }
-
-  /**
-   * Ustaw wariant warcabów
-   */
-  async setVariant(variant: string): Promise<boolean> {
-    try {
-      const result = await ScanModule.setVariant(variant);
-      if (result) {
-        this.currentVariant = variant;
-      }
-      return result;
-    } catch (error) {
-      console.error('Failed to set variant:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Pobierz format pozycji
-   */
-  async getPositionFormat(): Promise<string> {
-    try {
-      return await ScanModule.getPositionFormat();
-    } catch (error) {
-      console.error('Failed to get position format:', error);
-      return '';
-    }
-  }
-
-  /**
-   * Konwertuje pozycję z obiektu na string format
-   */
-  positionToString(position: DraughtsPosition): string {
-    const { white, black, whiteKings, blackKings, sideToMove } = position;
-    
-    const side = sideToMove === 'white' ? 'W' : 'B';
-    
-    // Połącz białe pionki i damki
-    const allWhite = [...white, ...whiteKings];
-    const allBlack = [...black, ...blackKings];
-    
-    let result = side;
-    
-    if (allWhite.length > 0) {
-      result += `:W${allWhite.join(',')}`;
-      if (whiteKings.length > 0) {
-        result += `,K${whiteKings.join(',')}`;
-      }
-    }
-    
-    if (allBlack.length > 0) {
-      result += `:B${allBlack.join(',')}`;
-      if (blackKings.length > 0) {
-        result += `,K${blackKings.join(',')}`;
-      }
-    }
-    
-    return result;
-  }
-
-  /**
-   * Konwertuje string pozycji na obiekt
-   */
-  parsePosition(positionString: string): DraughtsPosition {
-    const parts = positionString.split(':');
-    const sideToMove = parts[0] === 'W' ? 'white' : 'black';
-    
-    let white: number[] = [];
-    let black: number[] = [];
-    let whiteKings: number[] = [];
-    let blackKings: number[] = [];
-    
-    for (let i = 1; i < parts.length; i++) {
-      const part = parts[i];
-      
-      if (part.startsWith('W')) {
-        const pieces = part.substring(1).split(',');
-        for (const piece of pieces) {
-          if (piece.startsWith('K')) {
-            whiteKings.push(...piece.substring(1).split(',').map(n => parseInt(n)));
-          } else {
-            white.push(parseInt(piece));
-          }
-        }
-      } else if (part.startsWith('B')) {
-        const pieces = part.substring(1).split(',');
-        for (const piece of pieces) {
-          if (piece.startsWith('K')) {
-            blackKings.push(...piece.substring(1).split(',').map(n => parseInt(n)));
-          } else {
-            black.push(parseInt(piece));
-          }
-        }
-      }
-    }
-    
-    return { white, black, whiteKings, blackKings, sideToMove };
-  }
-
-  /**
-   * Parsuje ruch ze stringu
-   */
-  parseMove(moveString: string): DraughtsMove | null {
-    try {
-      // Format: "from-to" lub "fromxto" dla bicia
-      const isCapture = moveString.includes('x');
-      const separator = isCapture ? 'x' : '-';
-      const parts = moveString.split(separator);
-      
-      if (parts.length < 2) return null;
-      
-      const from = parseInt(parts[0]);
-      const to = parseInt(parts[parts.length - 1]);
-      
-      const captures: number[] = [];
-      if (isCapture && parts.length > 2) {
-        for (let i = 1; i < parts.length - 1; i++) {
-          captures.push(parseInt(parts[i]));
-        }
-      }
-      
-      return {
-        from,
-        to,
-        captures: captures.length > 0 ? captures : undefined
-      };
-    } catch (error) {
-      console.error('Failed to parse move:', moveString, error);
-      return null;
-    }
-  }
-
-  /**
-   * Nasłuchuje wyjścia silnika
-   */
-  addOutputListener(listener: (message: string) => void): () => void {
-    const subscription = ScanEventEmitter.addListener('scan-output', listener);
-    return () => subscription.remove();
-  }
-
-  /**
-   * Nasłuchuje analizowanych danych
-   */
-  addAnalysisListener(listener: (data: DraughtsAnalysisData) => void): () => void {
-    const subscription = ScanEventEmitter.addListener('scan-analyzed-output', (data: DraughtsAnalysisData) => {
-      if (data.type === 'done') {
-        this._isAnalyzing = false;
-      }
-      listener(data);
-    });
-    return () => subscription.remove();
-  }
-
-  /**
-   * Nasłuchuje błędów
-   */
-  addErrorListener(listener: (error: any) => void): () => void {
-    const subscription = ScanEventEmitter.addListener('scan-error', listener);
-    return () => subscription.remove();
-  }
-
-  /**
-   * Sprawdza czy silnik jest zainicjalizowany
-   */
-  isInitialized(): boolean {
-    return this.engineInitialized;
-  }
-
-  /**
-   * Sprawdza czy trwa analiza
-   */
-  isAnalyzing(): boolean {
-    return this._isAnalyzing;
-  }
-
-  /**
-   * Pobiera aktualny wariant
-   */
-  getCurrentVariant(): string {
-    return this.currentVariant;
-  }
-
-  /**
-   * Zatrzymuje silnik
+   * Shuts down the Scan engine.
+   * @returns Promise resolved as true if shutdown succeeded.
    */
   async shutdown(): Promise<boolean> {
     if (!this.engineInitialized) {
       return true;
     }
-
+    
+    // Clear any pending throttle timers
+    if (this.messageThrottleTimer) {
+      clearTimeout(this.messageThrottleTimer);
+      this.messageThrottleTimer = null;
+    }
+    
+    if (this.analysisThrottleTimer) {
+      clearTimeout(this.analysisThrottleTimer);
+      this.analysisThrottleTimer = null;
+    }
+    
     try {
-      console.log('Shutting down Scan engine');
-      
-      await this.stopAnalysis();
       await ScanModule.shutdownEngine();
-      
       this.engineInitialized = false;
-      this._isAnalyzing = false;
-      
-      // Clear pending commands
-      this.pendingCommands.forEach(({ reject }) => {
-        reject(new Error('Engine shutdown'));
-      });
-      this.pendingCommands.clear();
-      
-      console.log('Scan engine shutdown successfully');
       return true;
     } catch (error) {
       console.error('Failed to shutdown Scan engine:', error);
       return false;
     }
   }
+  
+  /**
+   * Emits throttled message events based on configuration.
+   */
+  private emitThrottledMessages(): void {
+    if (this.messageBuffer.length === 0 || !this.config.events.emitMessage) {
+      this.messageThrottleTimer = null;
+      return;
+    }
+    
+    // Only emit the latest message
+    const latestMessage = this.messageBuffer[this.messageBuffer.length - 1];
+    this.listeners.forEach(listener => listener(latestMessage));
+    
+    // Clear buffer after emitting
+    this.messageBuffer = [];
+    
+    // Schedule next emission if needed
+    this.messageThrottleTimer = setTimeout(
+      this.emitThrottledMessages,
+      this.config.throttling.messageInterval
+    );
+  }
+  
+  /**
+   * Emits throttled analysis events based on configuration.
+   */
+  private emitThrottledAnalysis(): void {
+    if (this.analysisBuffer.length === 0 || !this.config.events.emitAnalysis) {
+      this.analysisThrottleTimer = null;
+      return;
+    }
+    
+    // Emit the latest analysis data
+    const latestAnalysis = this.analysisBuffer[this.analysisBuffer.length - 1];
+    this.analysisListeners.forEach(listener => listener(latestAnalysis));
+    
+    // Clear buffer after emitting
+    this.analysisBuffer = [];
+    
+    // Schedule next emission if needed
+    this.analysisThrottleTimer = setTimeout(
+      this.emitThrottledAnalysis,
+      this.config.throttling.analysisInterval
+    );
+  }
+  
+  /**
+   * Handles output messages from the engine.
+   * @param message Message from the Scan engine.
+   */
+  handleOutput(message: string): void {
+    if (!this.config.events.emitMessage) return;
+    
+    // Add message to buffer
+    this.messageBuffer.push(message);
+    
+    // Start throttle timer if not running
+    if (this.messageThrottleTimer === null) {
+      this.messageThrottleTimer = setTimeout(
+        this.emitThrottledMessages,
+        this.config.throttling.messageInterval
+      );
+    }
+  }
+  
+  /**
+   * Handles analyzed output data from the engine.
+   * @param data Analyzed data from the Scan engine.
+   */
+  handleAnalysisOutput(data: AnalysisData | BestMoveData): void {
+    if (data.type === 'bestmove') {
+      // Store latest bestmove
+      this.lastBestMove = data as BestMoveData;
+      
+      // Immediately emit bestMove events if configured
+      if (this.config.events.emitBestMove) {
+        this.bestMoveListeners.forEach(listener => 
+          listener(data as BestMoveData));
+      }
+      
+      // Clear analysis buffer when bestmove arrives
+      this.analysisBuffer = [];
+      
+      // Cancel any pending analysis emissions
+      if (this.analysisThrottleTimer) {
+        clearTimeout(this.analysisThrottleTimer);
+        this.analysisThrottleTimer = null;
+      }
+    } else if (data.type === 'info') {
+      // Update analysis buffer with latest data
+      this.analysisBuffer.push(data as AnalysisData);
+      
+      // Start throttle timer if not running
+      if (this.analysisThrottleTimer === null) {
+        this.analysisThrottleTimer = setTimeout(
+          this.emitThrottledAnalysis,
+          this.config.throttling.analysisInterval
+        );
+      }
+    }
+  }
+  
+  /**
+   * Adds a message listener.
+   * @param listener Function to call for each message.
+   * @returns Function to remove the listener.
+   */
+  addMessageListener(listener: MessageListener): () => void {
+    this.listeners.push(listener);
+    return () => this.removeMessageListener(listener);
+  }
+  
+  /**
+   * Adds an analysis listener.
+   * @param listener Function to call for each analysis result.
+   * @returns Function to remove the listener.
+   */
+  addAnalysisListener(listener: AnalysisListener): () => void {
+    this.analysisListeners.push(listener);
+    return () => this.removeAnalysisListener(listener);
+  }
+  
+  /**
+   * Adds a bestmove listener.
+   * @param listener Function to call for each bestmove.
+   * @returns Function to remove the listener.
+   */
+  addBestMoveListener(listener: BestMoveListener): () => void {
+    this.bestMoveListeners.push(listener);
+    return () => this.removeBestMoveListener(listener);
+  }
+  
+  /**
+   * Removes a message listener.
+   * @param listener Listener to remove.
+   */
+  removeMessageListener(listener: MessageListener): void {
+    const index = this.listeners.indexOf(listener);
+    if (index !== -1) {
+      this.listeners.splice(index, 1);
+    }
+  }
+  
+  /**
+   * Removes an analysis listener.
+   * @param listener Listener to remove.
+   */
+  removeAnalysisListener(listener: AnalysisListener): void {
+    const index = this.analysisListeners.indexOf(listener);
+    if (index !== -1) {
+      this.analysisListeners.splice(index, 1);
+    }
+  }
+  
+  /**
+   * Removes a bestmove listener.
+   * @param listener Listener to remove.
+   */
+  removeBestMoveListener(listener: BestMoveListener): void {
+    const index = this.bestMoveListeners.indexOf(listener);
+    if (index !== -1) {
+      this.bestMoveListeners.splice(index, 1);
+    }
+  }
+  
+  /**
+   * Helper method to set position and start analysis.
+   * @param position Position in HUB format (WB notation).
+   * @param options Analysis options.
+   */
+  async analyzePosition(position: string, options: AnalysisOptions = {}): Promise<void> {
+    const { 
+      depth = 20, 
+      movetime, 
+      nodes,
+      infinite = false
+    } = options;
+    
+    await this.sendCommand('hub');
+    await this.sendCommand('init');
+    await this.sendCommand('new-game');
+    await this.sendCommand(`pos pos=${position}`);
+    
+    let levelCommand = '';
+    if (depth && !infinite) levelCommand += `level depth=${depth}`;
+    if (movetime) levelCommand += `level move-time=${movetime}`;
+    if (nodes) levelCommand += `level nodes=${nodes}`;
+    if (infinite) levelCommand += 'level infinite';
+    
+    if (levelCommand) await this.sendCommand(levelCommand);
+    await this.sendCommand('go analyze');
+  }
+  
+  /**
+   * Helper method to stop ongoing analysis.
+   */
+  async stopAnalysis(): Promise<void> {
+    await this.sendCommand('stop');
+  }
+  
+  /**
+   * Helper method to get computer move in a game.
+   * @param position Position in HUB format.
+   * @param movetime Time in milliseconds for the move (default 1000ms).
+   * @param depth Analysis depth (default 15).
+   */
+  async getComputerMove(position: string, movetime: number = 1000, depth: number = 15): Promise<void> {
+    await this.sendCommand('hub');
+    await this.sendCommand('init');
+    await this.sendCommand(`pos pos=${position}`);
+    await this.sendCommand(`level move-time=${movetime / 1000}`);
+    await this.sendCommand(`level depth=${depth}`);
+    await this.sendCommand('go think');
+  }
+  
+  /**
+   * Cleans up resources when done with the library.
+   */
+  destroy(): void {
+    // Clear any pending throttle timers
+    if (this.messageThrottleTimer) {
+      clearTimeout(this.messageThrottleTimer);
+      this.messageThrottleTimer = null;
+    }
+    
+    if (this.analysisThrottleTimer) {
+      clearTimeout(this.analysisThrottleTimer);
+      this.analysisThrottleTimer = null;
+    }
+    
+    this.shutdown().catch(console.error);
+    this.outputSubscription.remove();
+    this.analysisSubscription.remove();
+    this.listeners = [];
+    this.analysisListeners = [];
+    this.bestMoveListeners = [];
+  }
 }
 
+// Export a single instance, but allow custom configuration
 export default new Scan();
+
+// Also export the class for users who want to create custom instances
 export { Scan };

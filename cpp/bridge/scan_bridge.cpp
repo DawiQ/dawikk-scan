@@ -1,6 +1,39 @@
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS || TARGET_OS_IPHONE_SIMULATOR
+// iOS specific fixes
+#define MOBILE_BUILD 1
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
+#endif
+
 #include "scan_bridge.h"
 
-// C++ includes for Scan engine
+// Include all necessary Scan engine headers
+#include "../scan/src/bb_base.hpp"
+#include "../scan/src/bb_comp.hpp"
+#include "../scan/src/bb_index.hpp"
+#include "../scan/src/bit.hpp"
+#include "../scan/src/book.hpp"
+#include "../scan/src/common.hpp"
+#include "../scan/src/eval.hpp"
+#include "../scan/src/fen.hpp"     // THIS WAS MISSING - contains pos_hub and pos_from_hub
+#include "../scan/src/game.hpp"
+#include "../scan/src/gen.hpp"
+#include "../scan/src/hash.hpp"
+#include "../scan/src/hub.hpp"
+#include "../scan/src/libmy.hpp"
+#include "../scan/src/move.hpp"
+#include "../scan/src/pos.hpp"
+#include "../scan/src/search.hpp"
+#include "../scan/src/sort.hpp"
+#include "../scan/src/thread.hpp"
+#include "../scan/src/tt.hpp"
+#include "../scan/src/util.hpp"   // THIS WAS MISSING - contains Bad_Input
+#include "../scan/src/var.hpp"
+
 #include <stdio.h>
 #include <unistd.h>
 #include <string>
@@ -13,7 +46,6 @@
 #include <thread>
 #include <atomic>
 
-// Forward declaration - we'll include Scan headers
 namespace {
     constexpr int NUM_PIPES = 2;
     constexpr int PARENT_WRITE_PIPE = 0;
@@ -32,16 +64,13 @@ namespace {
     #define PARENT_WRITE_FD (pipes[PARENT_WRITE_PIPE][WRITE_FD])
 }
 
-// Global variable accessible to hub_main
+// Global variable for engine status
 static std::atomic<bool> g_engine_running{false};
 
-// Include Scan engine headers - we need to modify main.cpp functionality
-// For now, let's create a hub_main function that will be our entry point
+// Forward declaration of Scan's main hub loop
+static void hub_loop();
 
 extern "C" {
-
-// This will be our Scan engine entry point
-int hub_main();
 
 int scan_init(void) {
     // Create communication pipes
@@ -68,8 +97,29 @@ int scan_main(void) {
         engine_running.store(true);
         g_engine_running.store(true);
         
-        // Start the HUB engine - this will be our modified Scan main
-        hub_main();
+        try {
+            // Initialize Scan engine components
+            bit::init();
+            hash::init();
+            pos::init();
+            var::init();
+
+            bb::index_init();
+            bb::comp_init();
+
+            ml::rand_init();
+
+            // Start listening for input from React Native
+            listen_input();
+            bit::init(); // depends on the variant
+
+            // Run the actual Scan HUB protocol loop
+            hub_loop();
+        } catch (const std::exception& e) {
+            std::cerr << "Error in Scan engine: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "Unknown error in Scan engine" << std::endl;
+        }
         
         engine_running.store(false);
         g_engine_running.store(false);
@@ -128,160 +178,315 @@ void scan_shutdown(void) {
     close(pipes[PARENT_WRITE_PIPE][WRITE_FD]);
 }
 
-// Real HUB main function that integrates with Scan engine
-// Note: This is a simplified version without full Scan integration yet
-int hub_main() {
-    try {
-        // Variables for game state
-        std::string current_position = "Wbbbbbbbbbbbbbbbbbbbbeeeeeeeeeewwwwwwwwwwwwwwwwwwww"; // starting position
-        std::string variant = "normal";
-        int depth_limit = 15;
-        double time_limit = 1.0;
-        bool engine_ready = false;
-        
-        std::string line;
-        
-        while (g_engine_running.load() && std::getline(std::cin, line)) {
-            if (line.empty()) continue;
-            
-            std::istringstream iss(line);
-            std::string command;
-            iss >> command;
+} // extern "C"
 
-            if (command == "hub") {
-                // Send engine identification
-                std::cout << "id name=Scan version=3.1 author=\"Fabien Letouzey\" country=France" << std::endl;
-                std::cout << "param name=variant value=normal type=enum values=\"normal killer bt frisian losing\"" << std::endl;
-                std::cout << "param name=book value=true type=bool" << std::endl;
-                std::cout << "param name=book-ply value=4 type=int min=0 max=20" << std::endl;
-                std::cout << "param name=book-margin value=4 type=int min=0 max=100" << std::endl;
-                std::cout << "param name=threads value=1 type=int min=1 max=16" << std::endl;
-                std::cout << "param name=tt-size value=24 type=int min=16 max=30" << std::endl;
-                std::cout << "param name=bb-size value=5 type=int min=0 max=7" << std::endl;
-                std::cout << "wait" << std::endl;
-                std::cout.flush();
-                
+// Implementation of hub_loop from main.cpp
+static void hub_loop() {
+    Game game;
+    Search_Input si;
+
+    while (g_engine_running.load()) {
+        try {
+            std::string line = hub::read();
+            hub::Scanner scan(line);
+
+            if (scan.eos()) { // empty line
+                hub::error("missing command");
+                continue;
+            }
+
+            std::string command = scan.get_command();
+
+            if (command == "go") {
+                bool think = false;
+                bool ponder = false;
+                bool analyze = false;
+
+                while (!scan.eos()) {
+                    auto p = scan.get_pair();
+
+                    if (p.name == "think") {
+                        think = true;
+                    } else if (p.name == "ponder") {
+                        ponder = true;
+                    } else if (p.name == "analyze") {
+                        analyze = true;
+                    }
+                }
+
+                si.move = !analyze;
+                si.book = !analyze;
+                si.input = true;
+                si.output = Output_Hub;
+                si.ponder = ponder;
+
+                Search_Output so;
+                search(so, game.node(), si);
+
+                Move move = so.move;
+                Move answer = so.answer;
+
+                if (move == move::None) move = quick_move(game.node());
+
+                if (move != move::None && answer == move::None) {
+                    answer = quick_move(game.node().succ(move));
+                }
+
+                Pos p0 = game.pos();
+                Pos p1 = p0;
+                if (move != move::None) p1 = p0.succ(move);
+
+                std::string line = "done";
+                if (move   != move::None) hub::add_pair(line, "move",   move::to_hub(move, p0));
+                if (answer != move::None) hub::add_pair(line, "ponder", move::to_hub(answer, p1));
+                hub::write(line);
+
+                si.init(); // reset level
+
+            } else if (command == "hub") {
+                std::string line = "id";
+                hub::add_pair(line, "name", Engine_Name);
+                hub::add_pair(line, "version", Engine_Version);
+                hub::add_pair(line, "author", "Fabien Letouzey");
+                hub::add_pair(line, "country", "France");
+                hub::write(line);
+
+                // Engine parameters
+                std::string param_line = "param";
+                hub::add_pair(param_line, "name", "variant");
+                hub::add_pair(param_line, "value", "normal");
+                hub::add_pair(param_line, "type", "enum");
+                hub::add_pair(param_line, "values", "normal killer bt frisian losing");
+                hub::write(param_line);
+
+                param_line = "param";
+                hub::add_pair(param_line, "name", "book");
+                hub::add_pair(param_line, "value", "true");
+                hub::add_pair(param_line, "type", "bool");
+                hub::write(param_line);
+
+                param_line = "param";
+                hub::add_pair(param_line, "name", "book-ply");
+                hub::add_pair(param_line, "value", "4");
+                hub::add_pair(param_line, "type", "int");
+                hub::add_pair(param_line, "min", "0");
+                hub::add_pair(param_line, "max", "20");
+                hub::write(param_line);
+
+                param_line = "param";
+                hub::add_pair(param_line, "name", "book-margin");
+                hub::add_pair(param_line, "value", "4");
+                hub::add_pair(param_line, "type", "int");
+                hub::add_pair(param_line, "min", "0");
+                hub::add_pair(param_line, "max", "100");
+                hub::write(param_line);
+
+                param_line = "param";
+                hub::add_pair(param_line, "name", "threads");
+                hub::add_pair(param_line, "value", "1");
+                hub::add_pair(param_line, "type", "int");
+                hub::add_pair(param_line, "min", "1");
+                hub::add_pair(param_line, "max", "16");
+                hub::write(param_line);
+
+                param_line = "param";
+                hub::add_pair(param_line, "name", "tt-size");
+                hub::add_pair(param_line, "value", "24");
+                hub::add_pair(param_line, "type", "int");
+                hub::add_pair(param_line, "min", "16");
+                hub::add_pair(param_line, "max", "30");
+                hub::write(param_line);
+
+                param_line = "param";
+                hub::add_pair(param_line, "name", "bb-size");
+                hub::add_pair(param_line, "value", "5");
+                hub::add_pair(param_line, "type", "int");
+                hub::add_pair(param_line, "min", "0");
+                hub::add_pair(param_line, "max", "7");
+                hub::write(param_line);
+
+                hub::write("wait");
+
             } else if (command == "init") {
-                // Initialize engine
-                engine_ready = true;
-                std::cout << "ready" << std::endl;
-                std::cout.flush();
-                
-            } else if (command == "quit") {
-                break;
-                
-            } else if (command == "pos") {
-                // Parse position command: pos pos=<position> [moves=<moves>]
-                std::string token;
-                while (iss >> token) {
-                    if (token.find("pos=") == 0) {
-                        current_position = token.substr(4);
-                    } else if (token.find("moves=") == 0) {
-                        // Handle moves if provided
-                        std::string moves = token.substr(6);
-                        // Remove quotes if present
-                        if (!moves.empty() && moves[0] == '"' && moves.back() == '"') {
-                            moves = moves.substr(1, moves.length() - 2);
+                // Initialize engine components
+                try {
+                    bit::init(); // depends on the variant
+                    if (var::Book) {
+                        try {
+                            book::init();
+                        } catch (...) {
+                            // Book initialization failed, disable book
+                            var::set("book", "false");
+                            var::update();
                         }
-                        // Here you would apply moves to the position
                     }
+                    if (var::BB) {
+                        try {
+                            bb::init();
+                        } catch (...) {
+                            // BB initialization failed, disable bitbases
+                            var::set("bb-size", "0");
+                            var::update();
+                        }
+                    }
+
+                    eval_init();
+                    G_TT.set_size(var::TT_Size);
+                } catch (const std::exception& e) {
+                    std::cerr << "Init error: " << e.what() << std::endl;
                 }
                 
+                hub::write("ready");
+
             } else if (command == "level") {
-                // Parse level command
-                std::string token;
-                while (iss >> token) {
-                    if (token.find("depth=") == 0) {
-                        depth_limit = std::stoi(token.substr(6));
-                    } else if (token.find("move-time=") == 0) {
-                        time_limit = std::stod(token.substr(10));
-                    } else if (token.find("time=") == 0) {
-                        time_limit = std::stod(token.substr(5));
+                int depth = -1;
+                int64 nodes = -1;
+                double move_time = -1.0;
+
+                bool smart = false;
+                int moves = 0;
+                double game_time = 30.0;
+                double inc = 0.0;
+
+                bool infinite = false;
+                bool ponder = false;
+
+                while (!scan.eos()) {
+                    auto p = scan.get_pair();
+
+                    if (p.name == "depth") {
+                        depth = std::stoi(p.value);
+                    } else if (p.name == "nodes") {
+                        nodes = std::stoll(p.value);
+                    } else if (p.name == "move-time") {
+                        move_time = std::stod(p.value);
+                    } else if (p.name == "moves") {
+                        smart = true;
+                        moves = std::stoi(p.value);
+                    } else if (p.name == "time") {
+                        smart = true;
+                        game_time = std::stod(p.value);
+                    } else if (p.name == "inc") {
+                        smart = true;
+                        inc = std::stod(p.value);
+                    } else if (p.name == "infinite") {
+                        infinite = true;
+                    } else if (p.name == "ponder") {
+                        ponder = true;
                     }
                 }
-                
-            } else if (command == "go") {
-                std::string mode;
-                iss >> mode;
-                
-                if (!engine_ready) {
+
+                if (depth >= 0) si.depth = Depth(depth);
+                if (nodes >= 0) si.nodes = nodes;
+                if (move_time >= 0.0) si.time = move_time;
+
+                if (smart) si.set_time(moves, game_time, inc);
+
+            } else if (command == "new-game") {
+                G_TT.clear();
+
+            } else if (command == "ping") {
+                hub::write("pong");
+
+            } else if (command == "ponder-hit") {
+                // no-op (handled during search)
+
+            } else if (command == "pos") {
+                std::string pos = pos_hub(pos::Start);
+                std::string moves;
+
+                while (!scan.eos()) {
+                    auto p = scan.get_pair();
+
+                    if (p.name == "start") {
+                        pos = pos_hub(pos::Start);
+                    } else if (p.name == "pos") {
+                        pos = p.value;
+                    } else if (p.name == "moves") {
+                        moves = p.value;
+                    }
+                }
+
+                // position
+                try {
+                    game.init(pos_from_hub(pos));
+                } catch (const Bad_Input &) {
+                    hub::error("bad position");
+                    continue;
+                } catch (...) {
+                    hub::error("bad position format");
                     continue;
                 }
-                
-                if (mode == "think" || mode == "analyze") {
-                    // Simulate analysis/thinking
-                    // In real implementation, this would call the Scan engine
-                    
-                    // Send analysis info
-                    for (int d = 1; d <= std::min(depth_limit, 5); d++) {
-                        std::cout << "info depth=" << d 
-                                  << " mean-depth=" << (d + 0.5)
-                                  << " score=" << (0.15 * d / 5.0)
-                                  << " nodes=" << (1000 * d)
-                                  << " time=" << (0.1 * d)
-                                  << " nps=" << (10000.0)
-                                  << " pv=\"32-28";
-                        if (d > 1) std::cout << " 19-23";
-                        if (d > 2) std::cout << " 28-24";
-                        std::cout << "\"" << std::endl;
-                        std::cout.flush();
-                    }
-                    
-                    // Send final move
-                    std::cout << "done move=32-28 ponder=19-23" << std::endl;
-                    std::cout.flush();
-                    
-                } else if (mode == "ponder") {
-                    // Pondering mode - think on opponent's time
-                    std::cout << "info depth=3 score=0.10 nodes=5000 time=0.500 nps=10000.0 pv=\"32-28 19-23\"" << std::endl;
-                    std::cout.flush();
-                }
-                
-            } else if (command == "stop") {
-                // Stop current calculation
-                std::cout << "done move=32-28" << std::endl;
-                std::cout.flush();
-                
-            } else if (command == "new-game") {
-                // Clear transposition table and reset
-                current_position = "Wbbbbbbbbbbbbbbbbbbbbeeeeeeeeeewwwwwwwwwwwwwwwwwwww";
-                
-            } else if (command == "ping") {
-                std::cout << "pong" << std::endl;
-                std::cout.flush();
-                
-            } else if (command == "set-param") {
-                // Parse parameter setting: set-param name=<n> value=<value>
-                std::string token;
-                std::string param_name, param_value;
-                while (iss >> token) {
-                    if (token.find("name=") == 0) {
-                        param_name = token.substr(5);
-                    } else if (token.find("value=") == 0) {
-                        param_value = token.substr(6);
-                    }
-                }
-                
-                if (param_name == "variant") {
-                    variant = param_value;
-                }
-                // Handle other parameters as needed
-                
-            } else if (command == "ponder-hit") {
-                // Ponder hit - opponent played expected move
-                std::cout << "done move=32-28" << std::endl;
-                std::cout.flush();
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Error in hub_main: " << e.what() << std::endl;
-        return -1;
-    } catch (...) {
-        std::cerr << "Unknown error in hub_main" << std::endl;
-        return -1;
-    }
-    
-    return 0;
-}
 
-} // extern "C"
+                // moves
+                std::stringstream ss(moves);
+                std::string arg;
+
+                while (ss >> arg) {
+                    try {
+                        Move mv = move::from_hub(arg, game.pos());
+
+                        if (!move::is_legal(mv, game.pos())) {
+                            hub::error("illegal move");
+                            break;
+                        } else {
+                            game.add_move(mv);
+                        }
+
+                    } catch (const Bad_Input &) {
+                        hub::error("bad move");
+                        break;
+                    } catch (...) {
+                        hub::error("bad move format");
+                        break;
+                    }
+                }
+
+                si.init(); // reset level
+
+            } else if (command == "quit") {
+                g_engine_running.store(false);
+                break;
+
+            } else if (command == "set-param") {
+                std::string name;
+                std::string value;
+
+                while (!scan.eos()) {
+                    auto p = scan.get_pair();
+
+                    if (p.name == "name") {
+                        name = p.value;
+                    } else if (p.name == "value") {
+                        value = p.value;
+                    }
+                }
+
+                if (name.empty()) {
+                    hub::error("missing name");
+                    continue;
+                }
+
+                try {
+                    var::set(name, value);
+                    var::update();
+                } catch (...) {
+                    hub::error("invalid parameter");
+                }
+
+            } else if (command == "stop") {
+                // no-op (handled during search)
+
+            } else { // unknown command
+                hub::error("bad command");
+                continue;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Hub loop error: " << e.what() << std::endl;
+            hub::error("internal error");
+        } catch (...) {
+            std::cerr << "Unknown hub loop error" << std::endl;
+            hub::error("unknown error");
+        }
+    }
+}

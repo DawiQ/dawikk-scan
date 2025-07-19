@@ -2,8 +2,8 @@
 //  RNScanModule.m
 //  dawikk-scan
 //
-//  React Native bridge for the Scan draughts engine
-//  Implementation of the Scan 3.1 engine integration
+//  Fixed React Native bridge for the Scan draughts engine
+//  Thread-safe implementation with proper error handling
 //
 //  Created by dawikk-scan
 //  Copyright © 2024. All rights reserved.
@@ -12,7 +12,6 @@
 #import "RNScanModule.h"
 #import <React/RCTLog.h>
 #import <React/RCTUtils.h>
-#import <pthread.h>
 
 // Import the C++ bridge header
 #include "scan_bridge.h"
@@ -29,219 +28,276 @@ NSString * const kScanVariantLosing = @"losing";
 // Event names emitted by this module
 NSString * const kScanEventOutput = @"scan-output";
 NSString * const kScanEventAnalyzedOutput = @"scan-analyzed-output";
+NSString * const kScanEventError = @"scan-error";
+NSString * const kScanEventStatus = @"scan-status";
+
+// Engine status constants
+NSString * const kScanStatusStopped = @"stopped";
+NSString * const kScanStatusInitializing = @"initializing";
+NSString * const kScanStatusReady = @"ready";
+NSString * const kScanStatusThinking = @"thinking";
+NSString * const kScanStatusError = @"error";
 
 // Standard starting position for international draughts
 NSString * const kScanStartingPosition = @"Wbbbbbbbbbbbbbbbbbbbbeeeeeeeeeewwwwwwwwwwwwwwwwwwww";
 
-#pragma mark - Thread Functions
+// Error codes
+NSString * const kScanErrorInitFailed = @"INIT_FAILED";
+NSString * const kScanErrorNotInitialized = @"NOT_INITIALIZED";
+NSString * const kScanErrorAlreadyRunning = @"ALREADY_RUNNING";
+NSString * const kScanErrorInvalidCommand = @"INVALID_COMMAND";
+NSString * const kScanErrorEngineError = @"ENGINE_ERROR";
+NSString * const kScanErrorTimeout = @"TIMEOUT";
 
-void *engineThreadFunction(void *arg);
-void *listenerThreadFunction(void *arg);
+#pragma mark - Message Callback
+
+// C callback function for engine messages
+void engineMessageCallback(const char* message, void* context) {
+    if (!message || !context) return;
+    
+    RNScanModule* module = (__bridge RNScanModule*)context;
+    NSString* messageString = [NSString stringWithUTF8String:message];
+    
+    // Dispatch to main queue to ensure thread safety
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [module processEngineMessage:messageString];
+    });
+}
 
 #pragma mark - Implementation
 
 @implementation RNScanModule {
-    pthread_t engineThread;
-    pthread_t listenerThread;
-    BOOL engineRunning;
-    BOOL listenerRunning;
-    NSString *dataPath;
+    NSString *_dataPath;
+    NSString *_lastStatus;
+    NSString *_lastError;
+    dispatch_queue_t _engineQueue;
+    BOOL _hasListeners;
 }
 
 #pragma mark - Module Setup
 
 RCT_EXPORT_MODULE()
 
-+ (BOOL)requiresMainQueueSetup
-{
++ (BOOL)requiresMainQueueSetup {
     return NO;
 }
 
-- (NSArray<NSString *> *)supportedEvents
-{
-    return @[kScanEventOutput, kScanEventAnalyzedOutput];
+- (NSArray<NSString *> *)supportedEvents {
+    return @[kScanEventOutput, kScanEventAnalyzedOutput, kScanEventError, kScanEventStatus];
 }
 
-- (instancetype)init
-{
+- (instancetype)init {
     self = [super init];
     if (self) {
-        engineRunning = NO;
-        listenerRunning = NO;
-        dataPath = nil;
+        _dataPath = nil;
+        _lastStatus = kScanStatusStopped;
+        _lastError = nil;
+        _hasListeners = NO;
+        
+        // Create a serial queue for engine operations
+        _engineQueue = dispatch_queue_create("com.dawikk.scan.engine", DISPATCH_QUEUE_SERIAL);
+        
         [self setupDataPath];
+        [self setupEngineCallback];
     }
     return self;
 }
 
+- (void)startObserving {
+    _hasListeners = YES;
+}
+
+- (void)stopObserving {
+    _hasListeners = NO;
+}
+
 #pragma mark - Property Getters
 
-- (BOOL)isEngineRunning
-{
-    @synchronized(self) {
-        return engineRunning;
-    }
+- (BOOL)isEngineInitialized {
+    ScanStatus status = scan_bridge_get_status();
+    return status != SCAN_STATUS_STOPPED;
 }
 
-- (BOOL)isListenerRunning
-{
-    @synchronized(self) {
-        return listenerRunning;
-    }
+- (BOOL)isEngineReady {
+    return scan_bridge_is_ready();
 }
 
-- (NSString *)dataPath
-{
-    @synchronized(self) {
-        return dataPath;
-    }
+- (NSString *)engineStatus {
+    return [self statusStringFromEnum:scan_bridge_get_status()];
 }
 
-#pragma mark - Data Path Setup
+- (NSString *)lastError {
+    const char* errorCStr = scan_bridge_get_last_error();
+    if (errorCStr && strlen(errorCStr) > 0) {
+        return [NSString stringWithUTF8String:errorCStr];
+    }
+    return _lastError;
+}
 
-- (void)setupDataPath
-{
+- (NSString *)dataPath {
+    return _dataPath;
+}
+
+#pragma mark - Setup Methods
+
+- (void)setupDataPath {
     // Get the path to the ScanData bundle
     NSBundle *scanBundle = [NSBundle bundleWithPath:[[NSBundle mainBundle] pathForResource:@"ScanData" ofType:@"bundle"]];
     if (scanBundle) {
-        @synchronized(self) {
-            dataPath = [scanBundle bundlePath];
-        }
-        RCTLogInfo(@"ScanData bundle found at: %@", dataPath);
+        _dataPath = [scanBundle bundlePath];
+        RCTLogInfo(@"ScanData bundle found at: %@", _dataPath);
         
         // Set working directory to the data path so Scan can find its files
-        const char *path = [dataPath UTF8String];
+        const char *path = [_dataPath UTF8String];
         if (chdir(path) != 0) {
-            RCTLogError(@"Failed to change working directory to: %@", dataPath);
+            RCTLogError(@"Failed to change working directory to: %@", _dataPath);
         } else {
-            RCTLogInfo(@"Changed working directory to: %@", dataPath);
+            RCTLogInfo(@"Changed working directory to: %@", _dataPath);
         }
     } else {
         RCTLogError(@"ScanData bundle not found!");
         // Try to find data in main bundle as fallback
-        @synchronized(self) {
-            dataPath = [[NSBundle mainBundle] bundlePath];
-        }
-        RCTLogInfo(@"Using main bundle path as fallback: %@", dataPath);
+        _dataPath = [[NSBundle mainBundle] bundlePath];
+        RCTLogInfo(@"Using main bundle path as fallback: %@", _dataPath);
     }
 }
 
-#pragma mark - Thread Functions Implementation
-
-void *engineThreadFunction(void *arg)
-{
-    @autoreleasepool {
-        // Call the C++ function to start the Scan engine
-        scan_main();
-    }
-    return NULL;
+- (void)setupEngineCallback {
+    // Set up the C callback for engine messages
+    scan_bridge_set_callback(engineMessageCallback, (__bridge void*)self);
 }
 
-void *listenerThreadFunction(void *arg)
-{
-    @autoreleasepool {
-        RNScanModule *module = (__bridge RNScanModule *)arg;
-        
-        while ([module isListenerRunning]) {
-            const char *output = scan_stdout_read();
-            if (output != NULL && strlen(output) > 0) {
-                NSString *outputString = [NSString stringWithUTF8String:output];
-                if (outputString.length > 0) {
-                    [module processEngineOutput:outputString];
-                }
-            }
-            // Add a small delay to avoid high CPU usage
-            [NSThread sleepForTimeInterval:0.01];
-        }
+#pragma mark - Status Helpers
+
+- (NSString *)statusStringFromEnum:(ScanStatus)status {
+    switch (status) {
+        case SCAN_STATUS_STOPPED:
+            return kScanStatusStopped;
+        case SCAN_STATUS_INITIALIZING:
+            return kScanStatusInitializing;
+        case SCAN_STATUS_READY:
+            return kScanStatusReady;
+        case SCAN_STATUS_THINKING:
+            return kScanStatusThinking;
+        case SCAN_STATUS_ERROR:
+            return kScanStatusError;
+        default:
+            return kScanStatusError;
     }
-    
-    return NULL;
 }
 
-#pragma mark - Engine Output Processing
+- (NSString *)errorCodeFromEnum:(ScanResult)result {
+    switch (result) {
+        case SCAN_SUCCESS:
+            return nil;
+        case SCAN_ERROR_INIT_FAILED:
+            return kScanErrorInitFailed;
+        case SCAN_ERROR_NOT_INITIALIZED:
+            return kScanErrorNotInitialized;
+        case SCAN_ERROR_ALREADY_RUNNING:
+            return kScanErrorAlreadyRunning;
+        case SCAN_ERROR_INVALID_COMMAND:
+            return kScanErrorInvalidCommand;
+        case SCAN_ERROR_ENGINE_ERROR:
+            return kScanErrorEngineError;
+        case SCAN_ERROR_TIMEOUT:
+            return kScanErrorTimeout;
+        default:
+            return kScanErrorEngineError;
+    }
+}
 
-- (void)processEngineOutput:(NSString *)output
-{
-    if (output.length == 0) return;
+#pragma mark - Engine Message Processing
+
+- (void)processEngineMessage:(NSString *)message {
+    if (message.length == 0) return;
     
     // Trim whitespace and newlines
-    NSString *trimmedOutput = [output stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmedOutput.length == 0) return;
+    NSString *trimmedMessage = [message stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmedMessage.length == 0) return;
     
     // Send raw output to JavaScript
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self sendEventWithName:kScanEventOutput body:trimmedOutput];
-    });
+    [self emitRawOutput:trimmedMessage];
     
     // Process HUB protocol output
-    if ([trimmedOutput hasPrefix:@"info"]) {
-        [self sendAnalyzedOutput:trimmedOutput];
-    } else if ([trimmedOutput hasPrefix:@"done"]) {
-        [self sendBestMoveOutput:trimmedOutput];
-    } else if ([trimmedOutput hasPrefix:@"id"]) {
-        [self sendEngineInfo:trimmedOutput];
-    } else if ([trimmedOutput hasPrefix:@"param"]) {
-        [self sendParameterInfo:trimmedOutput];
-    } else if ([trimmedOutput hasPrefix:@"wait"] || 
-               [trimmedOutput hasPrefix:@"ready"] || 
-               [trimmedOutput hasPrefix:@"pong"]) {
-        // These are also important HUB responses
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self sendEventWithName:kScanEventAnalyzedOutput body:@{
-                @"type": trimmedOutput,
-                @"message": trimmedOutput
-            }];
-        });
+    if ([trimmedMessage hasPrefix:@"info"]) {
+        [self processAnalysisOutput:trimmedMessage];
+    } else if ([trimmedMessage hasPrefix:@"done"]) {
+        [self processBestMoveOutput:trimmedMessage];
+    } else if ([trimmedMessage hasPrefix:@"id"]) {
+        [self processEngineInfo:trimmedMessage];
+    } else if ([trimmedMessage hasPrefix:@"param"]) {
+        [self processParameterInfo:trimmedMessage];
+    } else if ([trimmedMessage hasPrefix:@"error"]) {
+        [self processErrorMessage:trimmedMessage];
+    } else if ([trimmedMessage hasPrefix:@"wait"] || 
+               [trimmedMessage hasPrefix:@"ready"] || 
+               [trimmedMessage hasPrefix:@"pong"]) {
+        [self processStatusMessage:trimmedMessage];
     }
+    
+    // Check for status changes
+    [self checkStatusChange];
 }
 
-- (void)sendEngineInfo:(NSString *)line
-{
-    // Format: "id name=Scan version=3.1 author=\"Fabien Letouzey\" country=France"
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    result[@"type"] = @"id";
-    
-    [self parseHubLine:line intoDictionary:result];
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self sendEventWithName:kScanEventAnalyzedOutput body:result];
-    });
-}
-
-- (void)sendParameterInfo:(NSString *)line
-{
-    // Format: "param name=variant value=normal type=enum values=\"normal killer bt frisian losing\""
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    result[@"type"] = @"param";
-    
-    [self parseHubLine:line intoDictionary:result];
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self sendEventWithName:kScanEventAnalyzedOutput body:result];
-    });
-}
-
-- (void)sendBestMoveOutput:(NSString *)line
-{
-    // Format: "done move=32-28 ponder=19-23"
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    result[@"type"] = @"bestmove";
-    
-    [self parseHubLine:line intoDictionary:result];
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self sendEventWithName:kScanEventAnalyzedOutput body:result];
-    });
-}
-
-- (void)sendAnalyzedOutput:(NSString *)line
-{
-    // Parse HUB info line: info depth=5 score=0.15 nodes=1000 time=0.100 nps=10000.0 pv="32-28 19-23"
+- (void)processAnalysisOutput:(NSString *)line {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     result[@"type"] = @"info";
     
     [self parseHubLine:line intoDictionary:result];
     
+    // Convert string values to appropriate types
+    [self convertAnalysisValues:result];
+    
+    [self emitAnalyzedOutput:result];
+}
+
+- (void)processBestMoveOutput:(NSString *)line {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"type"] = @"bestmove";
+    
+    [self parseHubLine:line intoDictionary:result];
+    
+    [self emitAnalyzedOutput:result];
+}
+
+- (void)processEngineInfo:(NSString *)line {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"type"] = @"id";
+    
+    [self parseHubLine:line intoDictionary:result];
+    
+    [self emitAnalyzedOutput:result];
+}
+
+- (void)processParameterInfo:(NSString *)line {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"type"] = @"param";
+    
+    [self parseHubLine:line intoDictionary:result];
+    
+    [self emitAnalyzedOutput:result];
+}
+
+- (void)processErrorMessage:(NSString *)line {
+    NSMutableDictionary *errorInfo = [NSMutableDictionary dictionary];
+    [self parseHubLine:line intoDictionary:errorInfo];
+    
+    NSString *errorMessage = errorInfo[@"message"] ?: line;
+    _lastError = errorMessage;
+    
+    [self emitError:errorMessage];
+}
+
+- (void)processStatusMessage:(NSString *)line {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"type"] = line;
+    result[@"message"] = line;
+    
+    [self emitAnalyzedOutput:result];
+}
+
+- (void)convertAnalysisValues:(NSMutableDictionary *)result {
     // Convert string values to appropriate types
     if (result[@"depth"]) {
         result[@"depth"] = @([result[@"depth"] intValue]);
@@ -276,14 +332,9 @@ void *listenerThreadFunction(void *arg)
             result[@"bestMove"] = moves[0];
         }
     }
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self sendEventWithName:kScanEventAnalyzedOutput body:result];
-    });
 }
 
-- (void)parseHubLine:(NSString *)line intoDictionary:(NSMutableDictionary *)dict
-{
+- (void)parseHubLine:(NSString *)line intoDictionary:(NSMutableDictionary *)dict {
     // Parse HUB format: command key1=value1 key2=value2 key3="quoted value"
     NSArray *parts = [line componentsSeparatedByString:@" "];
     
@@ -325,126 +376,315 @@ void *listenerThreadFunction(void *arg)
     }
 }
 
+- (void)checkStatusChange {
+    NSString *currentStatus = [self engineStatus];
+    if (![currentStatus isEqualToString:_lastStatus]) {
+        _lastStatus = currentStatus;
+        [self emitStatusChange:currentStatus];
+    }
+}
+
+#pragma mark - Event Emission
+
+- (void)emitRawOutput:(NSString *)message {
+    if (_hasListeners) {
+        [self sendEventWithName:kScanEventOutput body:message];
+    }
+}
+
+- (void)emitAnalyzedOutput:(NSDictionary *)data {
+    if (_hasListeners) {
+        [self sendEventWithName:kScanEventAnalyzedOutput body:data];
+    }
+}
+
+- (void)emitError:(NSString *)error {
+    if (_hasListeners) {
+        [self sendEventWithName:kScanEventError body:@{@"error": error}];
+    }
+}
+
+- (void)emitStatusChange:(NSString *)status {
+    if (_hasListeners) {
+        [self sendEventWithName:kScanEventStatus body:@{@"status": status}];
+    }
+}
+
 #pragma mark - React Native Exported Methods
 
 RCT_EXPORT_METHOD(initEngine:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-{
-    @synchronized(self) {
-        if (engineRunning) {
-            resolve(@(YES));
-            return;
-        }
-    }
+                  rejecter:(RCTPromiseRejectBlock)reject) {
     
-    // Ensure data path is set up
-    [self setupDataPath];
+    dispatch_async(_engineQueue, ^{
+        ScanResult result = scan_bridge_init();
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (result == SCAN_SUCCESS) {
+                RCTLogInfo(@"Scan engine initialized successfully");
+                resolve(@(YES));
+            } else {
+                NSString *errorCode = [self errorCodeFromEnum:result];
+                NSString *errorMessage = [self lastError] ?: @"Failed to initialize Scan engine";
+                RCTLogError(@"Failed to initialize Scan engine: %@", errorMessage);
+                reject(errorCode, errorMessage, nil);
+            }
+        });
+    });
+}
+
+RCT_EXPORT_METHOD(startEngine:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
     
-    // Initialize the Scan engine
-    int initResult = scan_init();
-    if (initResult != 0) {
-        NSString *errorMsg = [NSString stringWithFormat:@"Failed to initialize Scan engine: %d", initResult];
-        reject(@"INIT_ERROR", errorMsg, nil);
-        return;
-    }
-    
-    // Start the engine thread
-    int status = pthread_create(&engineThread, NULL, engineThreadFunction, NULL);
-    if (status != 0) {
-        NSString *errorMsg = [NSString stringWithFormat:@"Failed to create engine thread: %d", status];
-        reject(@"THREAD_ERROR", errorMsg, nil);
-        return;
-    }
-    
-    @synchronized(self) {
-        engineRunning = YES;
-    }
-    
-    // Start the listener thread
-    @synchronized(self) {
-        listenerRunning = YES;
-    }
-    
-    status = pthread_create(&listenerThread, NULL, listenerThreadFunction, (__bridge void *)self);
-    if (status != 0) {
-        NSString *errorMsg = [NSString stringWithFormat:@"Failed to create listener thread: %d", status];
-        @synchronized(self) {
-            listenerRunning = NO;
-        }
-        reject(@"THREAD_ERROR", errorMsg, nil);
-        return;
-    }
-    
-    RCTLogInfo(@"Scan engine initialized successfully");
-    resolve(@(YES));
+    dispatch_async(_engineQueue, ^{
+        ScanResult result = scan_bridge_start();
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (result == SCAN_SUCCESS) {
+                RCTLogInfo(@"Scan engine started successfully");
+                resolve(@(YES));
+            } else {
+                NSString *errorCode = [self errorCodeFromEnum:result];
+                NSString *errorMessage = [self lastError] ?: @"Failed to start Scan engine";
+                RCTLogError(@"Failed to start Scan engine: %@", errorMessage);
+                reject(errorCode, errorMessage, nil);
+            }
+        });
+    });
 }
 
 RCT_EXPORT_METHOD(sendCommand:(NSString *)command
                   resolver:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-{
-    @synchronized(self) {
-        if (!engineRunning) {
-            reject(@"ENGINE_NOT_RUNNING", @"Scan engine is not running", nil);
-            return;
-        }
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    if (command.length == 0) {
+        reject(kScanErrorInvalidCommand, @"Command cannot be empty", nil);
+        return;
     }
     
-    const char *cmd = [command UTF8String];
-    int success = scan_stdin_write(cmd);
+    dispatch_async(_engineQueue, ^{
+        ScanResult result = scan_bridge_send_command([command UTF8String]);
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (result == SCAN_SUCCESS) {
+                RCTLogInfo(@"Sent command to Scan: %@", command);
+                resolve(@(YES));
+            } else {
+                NSString *errorCode = [self errorCodeFromEnum:result];
+                NSString *errorMessage = [NSString stringWithFormat:@"Failed to send command: %@", command];
+                RCTLogError(@"%@", errorMessage);
+                reject(errorCode, errorMessage, nil);
+            }
+        });
+    });
+}
+
+RCT_EXPORT_METHOD(getStatus:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
     
-    if (success) {
-        RCTLogInfo(@"Sent command to Scan: %@", command);
-        resolve(@(YES));
-    } else {
-        RCTLogError(@"Failed to send command to Scan: %@", command);
-        reject(@"COMMAND_FAILED", @"Failed to send command to Scan", nil);
+    NSString *status = [self engineStatus];
+    resolve(status);
+}
+
+RCT_EXPORT_METHOD(isReady:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    BOOL ready = scan_bridge_is_ready();
+    resolve(@(ready));
+}
+
+RCT_EXPORT_METHOD(waitReady:(NSNumber *)timeout
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    int timeoutSeconds = [timeout intValue];
+    if (timeoutSeconds <= 0) {
+        timeoutSeconds = 10; // Default timeout
     }
+    
+    dispatch_async(_engineQueue, ^{
+        BOOL ready = scan_bridge_wait_ready(timeoutSeconds);
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            resolve(@(ready));
+        });
+    });
 }
 
 RCT_EXPORT_METHOD(shutdownEngine:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-{
-    @synchronized(self) {
-        if (!engineRunning) {
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    dispatch_async(_engineQueue, ^{
+        scan_bridge_shutdown();
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            RCTLogInfo(@"Scan engine shut down successfully");
             resolve(@(YES));
-            return;
+        });
+    });
+}
+
+#pragma mark - Convenience Methods
+
+RCT_EXPORT_METHOD(analyzePosition:(NSString *)position
+                  options:(NSDictionary *)options
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    if (position.length == 0) {
+        reject(kScanErrorInvalidCommand, @"Position cannot be empty", nil);
+        return;
+    }
+    
+    dispatch_async(_engineQueue, ^{
+        // Send commands in sequence
+        NSMutableArray *commands = [NSMutableArray array];
+        [commands addObject:@"hub"];
+        [commands addObject:@"init"];
+        [commands addObject:[NSString stringWithFormat:@"pos pos=%@", position]];
+        
+        // Add level commands based on options
+        NSNumber *depth = options[@"depth"];
+        NSNumber *time = options[@"time"];
+        NSNumber *nodes = options[@"nodes"];
+        BOOL infinite = [options[@"infinite"] boolValue];
+        
+        if (depth && !infinite) {
+            [commands addObject:[NSString stringWithFormat:@"level depth=%@", depth]];
         }
-    }
-    
-    RCTLogInfo(@"Shutting down Scan engine");
-    
-    // Send the quit command to Scan
-    scan_stdin_write("quit");
-    
-    // Stop the listener thread
-    @synchronized(self) {
-        listenerRunning = NO;
-    }
-    
-    // Wait for threads to finish
-    @synchronized(self) {
-        if (engineRunning) {
-            pthread_join(engineThread, NULL);
-            engineRunning = NO;
+        if (time) {
+            [commands addObject:[NSString stringWithFormat:@"level move-time=%.3f", [time doubleValue] / 1000.0]];
         }
+        if (nodes) {
+            [commands addObject:[NSString stringWithFormat:@"level nodes=%@", nodes]];
+        }
+        if (infinite) {
+            [commands addObject:@"level infinite"];
+        }
+        
+        [commands addObject:@"go analyze"];
+        
+        // Send all commands
+        BOOL success = YES;
+        for (NSString *cmd in commands) {
+            ScanResult result = scan_bridge_send_command([cmd UTF8String]);
+            if (result != SCAN_SUCCESS) {
+                success = NO;
+                break;
+            }
+            // Small delay between commands
+            usleep(10000); // 10ms
+        }
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success) {
+                resolve(@(YES));
+            } else {
+                reject(kScanErrorEngineError, @"Failed to start analysis", nil);
+            }
+        });
+    });
+}
+
+RCT_EXPORT_METHOD(getBestMove:(NSString *)position
+                  options:(NSDictionary *)options
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    if (position.length == 0) {
+        reject(kScanErrorInvalidCommand, @"Position cannot be empty", nil);
+        return;
     }
     
-    if (pthread_join(listenerThread, NULL) != 0) {
-        RCTLogError(@"Failed to join listener thread");
+    dispatch_async(_engineQueue, ^{
+        // Send commands for move search
+        NSMutableArray *commands = [NSMutableArray array];
+        [commands addObject:@"hub"];
+        [commands addObject:@"init"];
+        [commands addObject:[NSString stringWithFormat:@"pos pos=%@", position]];
+        
+        // Add search parameters
+        NSNumber *depth = options[@"depth"] ?: @15;
+        NSNumber *time = options[@"time"] ?: @1000;
+        
+        [commands addObject:[NSString stringWithFormat:@"level depth=%@", depth]];
+        [commands addObject:[NSString stringWithFormat:@"level move-time=%.3f", [time doubleValue] / 1000.0]];
+        [commands addObject:@"go think"];
+        
+        // Send all commands
+        BOOL success = YES;
+        for (NSString *cmd in commands) {
+            ScanResult result = scan_bridge_send_command([cmd UTF8String]);
+            if (result != SCAN_SUCCESS) {
+                success = NO;
+                break;
+            }
+            usleep(10000); // 10ms delay
+        }
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success) {
+                resolve(@(YES));
+            } else {
+                reject(kScanErrorEngineError, @"Failed to start move search", nil);
+            }
+        });
+    });
+}
+
+RCT_EXPORT_METHOD(stopAnalysis:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    dispatch_async(_engineQueue, ^{
+        ScanResult result = scan_bridge_send_command("stop");
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (result == SCAN_SUCCESS) {
+                resolve(@(YES));
+            } else {
+                NSString *errorCode = [self errorCodeFromEnum:result];
+                reject(errorCode, @"Failed to stop analysis", nil);
+            }
+        });
+    });
+}
+
+RCT_EXPORT_METHOD(setParameters:(NSDictionary *)params
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    
+    if (params.count == 0) {
+        resolve(@(YES));
+        return;
     }
     
-    // Clean up C++ bridge
-    scan_shutdown();
-    
-    RCTLogInfo(@"Scan engine shut down successfully");
-    resolve(@(YES));
+    dispatch_async(_engineQueue, ^{
+        BOOL success = YES;
+        
+        for (NSString *name in params) {
+            NSString *value = [NSString stringWithFormat:@"%@", params[name]];
+            NSString *command = [NSString stringWithFormat:@"set-param name=%@ value=%@", name, value];
+            
+            ScanResult result = scan_bridge_send_command([command UTF8String]);
+            if (result != SCAN_SUCCESS) {
+                success = NO;
+                break;
+            }
+            usleep(10000); // 10ms delay
+        }
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success) {
+                resolve(@(YES));
+            } else {
+                reject(kScanErrorEngineError, @"Failed to set parameters", nil);
+            }
+        });
+    });
 }
 
 #pragma mark - Module Lifecycle
 
-- (void)invalidate
-{
+- (void)invalidate {
     [self shutdownEngine:^(id result) {
         RCTLogInfo(@"Engine shutdown completed during invalidate");
     } rejecter:^(NSString *code, NSString *message, NSError *error) {
@@ -453,15 +693,8 @@ RCT_EXPORT_METHOD(shutdownEngine:(RCTPromiseResolveBlock)resolve
     [super invalidate];
 }
 
-- (void)dealloc
-{
-    // Ensure cleanup
-    @synchronized(self) {
-        if (engineRunning || listenerRunning) {
-            scan_stdin_write("quit");
-            scan_shutdown();
-        }
-    }
+- (void)dealloc {
+    scan_bridge_shutdown();
 }
 
 @end

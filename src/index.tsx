@@ -1,11 +1,16 @@
-import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
+import { NativeModules, NativeEventEmitter, Platform, AppState, AppStateStatus } from 'react-native';
 
 // Type definitions for draughts/checkers
 export interface AnalysisOptions {
   depth?: number;
-  movetime?: number;
+  time?: number; // in milliseconds
   nodes?: number;
   infinite?: boolean;
+}
+
+export interface SearchOptions {
+  depth?: number;
+  time?: number; // in milliseconds
 }
 
 export interface AnalysisData {
@@ -19,7 +24,6 @@ export interface AnalysisData {
   time?: number;
   nps?: number;
   meanDepth?: number;
-  fen?: string;
   
   // Engine identification data
   name?: string;
@@ -42,40 +46,48 @@ export interface BestMoveData {
   ponder?: string;
 }
 
-// Configuration for event throttling and filtering
-export interface ScanConfig {
-  // Throttling intervals (in ms)
-  throttling: {
-    analysisInterval: number;  // Time between analysis event emissions
-    messageInterval: number;   // Time between message event emissions
-  };
-  // Event emission control
-  events: {
-    emitMessage: boolean;      // Whether to emit raw message events
-    emitAnalysis: boolean;     // Whether to emit analysis events
-    emitBestMove: boolean;     // Whether to emit bestMove events
-  };
+export interface ErrorData {
+  error: string;
 }
+
+export interface StatusData {
+  status: EngineStatus;
+}
+
+// Engine status enum
+export type EngineStatus = 'stopped' | 'initializing' | 'ready' | 'thinking' | 'error';
 
 // Supported draughts variants
 export type DraughtsVariant = 'normal' | 'killer' | 'bt' | 'frisian' | 'losing';
 
+// Configuration for the Scan engine
+export interface ScanConfig {
+  // Engine parameters
+  variant?: DraughtsVariant;
+  book?: boolean;
+  bookPly?: number;
+  bookMargin?: number;
+  threads?: number;
+  hashSize?: number;
+  bitbaseSize?: number;
+}
+
+// Event listener types
 type MessageListener = (message: string) => void;
 type AnalysisListener = (data: AnalysisData) => void;
 type BestMoveListener = (data: BestMoveData) => void;
+type ErrorListener = (data: ErrorData) => void;
+type StatusListener = (data: StatusData) => void;
 
-// Default configuration
-const DEFAULT_CONFIG: ScanConfig = {
-  throttling: {
-    analysisInterval: 100,   // Default: 100ms between analysis events
-    messageInterval: 100,    // Default: 100ms between message events
-  },
-  events: {
-    emitMessage: true,
-    emitAnalysis: true,
-    emitBestMove: true,
-  }
-};
+// Error codes
+export const ERROR_CODES = {
+  INIT_FAILED: 'INIT_FAILED',
+  NOT_INITIALIZED: 'NOT_INITIALIZED',
+  ALREADY_RUNNING: 'ALREADY_RUNNING',
+  INVALID_COMMAND: 'INVALID_COMMAND',
+  ENGINE_ERROR: 'ENGINE_ERROR',
+  TIMEOUT: 'TIMEOUT'
+} as const;
 
 // Linking error handling
 const LINKING_ERROR =
@@ -99,446 +111,374 @@ const ScanModule = NativeModules.RNScanModule
 // Create event emitter
 export const ScanEventEmitter = new NativeEventEmitter(ScanModule);
 
-class Scan {
-  // Class properties
-  engineInitialized: boolean;
-  private listeners: MessageListener[];
-  private analysisListeners: AnalysisListener[];
-  private bestMoveListeners: BestMoveListener[];
+export class ScanEngine {
+  // Properties
+  private listeners: MessageListener[] = [];
+  private analysisListeners: AnalysisListener[] = [];
+  private bestMoveListeners: BestMoveListener[] = [];
+  private errorListeners: ErrorListener[] = [];
+  private statusListeners: StatusListener[] = [];
+  
   private outputSubscription: any;
   private analysisSubscription: any;
+  private errorSubscription: any;
+  private statusSubscription: any;
+  private appStateSubscription: any;
   
-  // Throttling properties
-  private config: ScanConfig;
-  private messageBuffer: string[] = [];
-  private analysisBuffer: AnalysisData[] = [];
-  private lastBestMove: BestMoveData | null = null;
-  private messageThrottleTimer: ReturnType<typeof setTimeout> | null = null;
-  private analysisThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentStatus: EngineStatus = 'stopped';
+  private isInitialized = false;
+  private isStarted = false;
+  private pendingMoveCallback: BestMoveListener | null = null;
   
-  constructor(config?: Partial<ScanConfig>) {
-    this.engineInitialized = false;
-    this.listeners = [];
-    this.analysisListeners = [];
-    this.bestMoveListeners = [];
-    
-    // Merge provided config with defaults
-    this.config = {
-      ...DEFAULT_CONFIG,
-      throttling: {
-        ...DEFAULT_CONFIG.throttling,
-        ...(config?.throttling || {})
-      },
-      events: {
-        ...DEFAULT_CONFIG.events,
-        ...(config?.events || {})
-      }
-    };
-    
-    // Bind methods
-    this.init = this.init.bind(this);
-    this.sendCommand = this.sendCommand.bind(this);
-    this.shutdown = this.shutdown.bind(this);
-    this.addMessageListener = this.addMessageListener.bind(this);
-    this.addAnalysisListener = this.addAnalysisListener.bind(this);
-    this.addBestMoveListener = this.addBestMoveListener.bind(this);
-    this.removeMessageListener = this.removeMessageListener.bind(this);
-    this.removeAnalysisListener = this.removeAnalysisListener.bind(this);
-    this.removeBestMoveListener = this.removeBestMoveListener.bind(this);
-    this.handleOutput = this.handleOutput.bind(this);
-    this.handleAnalysisOutput = this.handleAnalysisOutput.bind(this);
-    this.emitThrottledMessages = this.emitThrottledMessages.bind(this);
-    this.emitThrottledAnalysis = this.emitThrottledAnalysis.bind(this);
-    this.setConfig = this.setConfig.bind(this);
-    
-    // Set up event subscriptions
+  constructor() {
+    this.setupEventSubscriptions();
+    this.setupAppStateHandling();
+  }
+  
+  // Event subscription setup
+  private setupEventSubscriptions(): void {
     this.outputSubscription = ScanEventEmitter.addListener(
       'scan-output',
-      this.handleOutput
+      this.handleOutput.bind(this)
     );
     
     this.analysisSubscription = ScanEventEmitter.addListener(
       'scan-analyzed-output',
-      this.handleAnalysisOutput
+      this.handleAnalysisOutput.bind(this)
+    );
+    
+    this.errorSubscription = ScanEventEmitter.addListener(
+      'scan-error',
+      this.handleError.bind(this)
+    );
+    
+    this.statusSubscription = ScanEventEmitter.addListener(
+      'scan-status',
+      this.handleStatusChange.bind(this)
     );
   }
   
-  /**
-   * Updates the Scan configuration.
-   * @param config Partial configuration to update
-   */
-  setConfig(config: Partial<ScanConfig>): void {
-    this.config = {
-      ...this.config,
-      throttling: {
-        ...this.config.throttling,
-        ...(config.throttling || {})
-      },
-      events: {
-        ...this.config.events,
-        ...(config.events || {})
-      }
-    };
+  // App state handling for proper lifecycle management
+  private setupAppStateHandling(): void {
+    this.appStateSubscription = AppState.addEventListener(
+      'change',
+      this.handleAppStateChange.bind(this)
+    );
   }
+  
+  private handleAppStateChange(nextAppState: AppStateStatus): void {
+    if (nextAppState === 'background' && this.isStarted) {
+      // Pause engine when app goes to background
+      this.sendCommand('stop').catch(console.warn);
+    } else if (nextAppState === 'active' && this.isStarted) {
+      // Resume engine when app becomes active
+      // Engine should automatically be ready again
+    }
+  }
+  
+  // Event handlers
+  private handleOutput(message: string): void {
+    this.listeners.forEach(listener => {
+      try {
+        listener(message);
+      } catch (error) {
+        console.warn('Error in message listener:', error);
+      }
+    });
+  }
+  
+  private handleAnalysisOutput(data: AnalysisData | BestMoveData): void {
+    if (data.type === 'bestmove') {
+      const moveData = data as BestMoveData;
+      
+      // Handle pending move callback
+      if (this.pendingMoveCallback) {
+        try {
+          this.pendingMoveCallback(moveData);
+        } catch (error) {
+          console.warn('Error in move callback:', error);
+        }
+        this.pendingMoveCallback = null;
+      }
+      
+      // Notify bestmove listeners
+      this.bestMoveListeners.forEach(listener => {
+        try {
+          listener(moveData);
+        } catch (error) {
+          console.warn('Error in bestmove listener:', error);
+        }
+      });
+    } else {
+      const analysisData = data as AnalysisData;
+      this.analysisListeners.forEach(listener => {
+        try {
+          listener(analysisData);
+        } catch (error) {
+          console.warn('Error in analysis listener:', error);
+        }
+      });
+    }
+  }
+  
+  private handleError(data: ErrorData): void {
+    this.errorListeners.forEach(listener => {
+      try {
+        listener(data);
+      } catch (error) {
+        console.warn('Error in error listener:', error);
+      }
+    });
+  }
+  
+  private handleStatusChange(data: StatusData): void {
+    this.currentStatus = data.status;
+    this.statusListeners.forEach(listener => {
+      try {
+        listener(data);
+      } catch (error) {
+        console.warn('Error in status listener:', error);
+      }
+    });
+  }
+  
+  // Core engine methods
   
   /**
    * Initializes the Scan engine.
-   * @returns Promise resolved as true if initialization succeeded.
    */
-  async init(): Promise<boolean> {
-    if (this.engineInitialized) {
-      return true;
+  async init(): Promise<void> {
+    if (this.isInitialized) {
+      return;
     }
     
     try {
       await ScanModule.initEngine();
-      this.engineInitialized = true;
-      return true;
+      this.isInitialized = true;
     } catch (error) {
-      console.error('Failed to initialize Scan engine:', error);
-      return false;
+      throw new Error(`Failed to initialize engine: ${error}`);
     }
   }
   
   /**
-   * Sends a HUB command to the Scan engine.
-   * @param command HUB command to send.
-   * @returns Promise resolved as true if the command was sent.
+   * Starts the Scan engine thread.
    */
-  async sendCommand(command: string): Promise<boolean> {
-    if (!this.engineInitialized) {
+  async start(): Promise<void> {
+    if (!this.isInitialized) {
       await this.init();
     }
     
+    if (this.isStarted) {
+      return;
+    }
+    
     try {
-      return await ScanModule.sendCommand(command);
+      await ScanModule.startEngine();
+      this.isStarted = true;
+      
+      // Wait for engine to be ready
+      const ready = await ScanModule.waitReady(10);
+      if (!ready) {
+        throw new Error('Engine failed to become ready within timeout');
+      }
     } catch (error) {
-      console.error('Failed to send command to Scan:', error);
+      throw new Error(`Failed to start engine: ${error}`);
+    }
+  }
+  
+  /**
+   * Sends a HUB command to the engine.
+   */
+  async sendCommand(command: string): Promise<void> {
+    if (!this.isStarted) {
+      await this.start();
+    }
+    
+    try {
+      await ScanModule.sendCommand(command);
+    } catch (error) {
+      throw new Error(`Failed to send command '${command}': ${error}`);
+    }
+  }
+  
+  /**
+   * Gets the current engine status.
+   */
+  async getStatus(): Promise<EngineStatus> {
+    try {
+      return await ScanModule.getStatus();
+    } catch (error) {
+      return 'error';
+    }
+  }
+  
+  /**
+   * Checks if the engine is ready.
+   */
+  async isReady(): Promise<boolean> {
+    try {
+      return await ScanModule.isReady();
+    } catch (error) {
       return false;
     }
   }
   
   /**
-   * Shuts down the Scan engine.
-   * @returns Promise resolved as true if shutdown succeeded.
+   * Waits for the engine to be ready.
    */
-  async shutdown(): Promise<boolean> {
-    if (!this.engineInitialized) {
-      return true;
+  async waitReady(timeoutSeconds = 10): Promise<boolean> {
+    try {
+      return await ScanModule.waitReady(timeoutSeconds);
+    } catch (error) {
+      return false;
     }
-    
-    // Clear any pending throttle timers
-    if (this.messageThrottleTimer) {
-      clearTimeout(this.messageThrottleTimer);
-      this.messageThrottleTimer = null;
-    }
-    
-    if (this.analysisThrottleTimer) {
-      clearTimeout(this.analysisThrottleTimer);
-      this.analysisThrottleTimer = null;
-    }
-    
+  }
+  
+  /**
+   * Shuts down the engine.
+   */
+  async shutdown(): Promise<void> {
     try {
       await ScanModule.shutdownEngine();
-      this.engineInitialized = false;
-      return true;
+      this.isInitialized = false;
+      this.isStarted = false;
+      this.currentStatus = 'stopped';
     } catch (error) {
-      console.error('Failed to shutdown Scan engine:', error);
-      return false;
+      console.warn('Error during shutdown:', error);
     }
   }
   
-  /**
-   * Emits throttled message events based on configuration.
-   */
-  private emitThrottledMessages(): void {
-    if (this.messageBuffer.length === 0 || !this.config.events.emitMessage) {
-      this.messageThrottleTimer = null;
-      return;
-    }
-    
-    // Only emit the latest message
-    const latestMessage = this.messageBuffer[this.messageBuffer.length - 1];
-    this.listeners.forEach(listener => listener(latestMessage));
-    
-    // Clear buffer after emitting
-    this.messageBuffer = [];
-    
-    // Schedule next emission if needed
-    this.messageThrottleTimer = setTimeout(
-      this.emitThrottledMessages,
-      this.config.throttling.messageInterval
-    );
-  }
+  // High-level analysis methods
   
   /**
-   * Emits throttled analysis events based on configuration.
-   */
-  private emitThrottledAnalysis(): void {
-    if (this.analysisBuffer.length === 0 || !this.config.events.emitAnalysis) {
-      this.analysisThrottleTimer = null;
-      return;
-    }
-    
-    // Emit the latest analysis data
-    const latestAnalysis = this.analysisBuffer[this.analysisBuffer.length - 1];
-    this.analysisListeners.forEach(listener => listener(latestAnalysis));
-    
-    // Clear buffer after emitting
-    this.analysisBuffer = [];
-    
-    // Schedule next emission if needed
-    this.analysisThrottleTimer = setTimeout(
-      this.emitThrottledAnalysis,
-      this.config.throttling.analysisInterval
-    );
-  }
-  
-  /**
-   * Handles output messages from the engine.
-   * @param message Message from the Scan engine.
-   */
-  handleOutput(message: string): void {
-    if (!this.config.events.emitMessage) return;
-    
-    // Add message to buffer
-    this.messageBuffer.push(message);
-    
-    // Start throttle timer if not running
-    if (this.messageThrottleTimer === null) {
-      this.messageThrottleTimer = setTimeout(
-        this.emitThrottledMessages,
-        this.config.throttling.messageInterval
-      );
-    }
-  }
-  
-  /**
-   * Handles analyzed output data from the engine.
-   * @param data Analyzed data from the Scan engine.
-   */
-  handleAnalysisOutput(data: AnalysisData | BestMoveData): void {
-    if (data.type === 'bestmove') {
-      // Store latest bestmove
-      this.lastBestMove = data as BestMoveData;
-      
-      // Immediately emit bestMove events if configured
-      if (this.config.events.emitBestMove) {
-        this.bestMoveListeners.forEach(listener => 
-          listener(data as BestMoveData));
-      }
-      
-      // Clear analysis buffer when bestmove arrives
-      this.analysisBuffer = [];
-      
-      // Cancel any pending analysis emissions
-      if (this.analysisThrottleTimer) {
-        clearTimeout(this.analysisThrottleTimer);
-        this.analysisThrottleTimer = null;
-      }
-    } else if (data.type === 'info') {
-      // Update analysis buffer with latest data
-      this.analysisBuffer.push(data as AnalysisData);
-      
-      // Start throttle timer if not running
-      if (this.analysisThrottleTimer === null) {
-        this.analysisThrottleTimer = setTimeout(
-          this.emitThrottledAnalysis,
-          this.config.throttling.analysisInterval
-        );
-      }
-    } else {
-      // For 'id', 'param', and other types, emit immediately to analysis listeners
-      if (this.config.events.emitAnalysis) {
-        this.analysisListeners.forEach(listener => listener(data as AnalysisData));
-      }
-    }
-  }
-  
-  /**
-   * Adds a message listener.
-   * @param listener Function to call for each message.
-   * @returns Function to remove the listener.
-   */
-  addMessageListener(listener: MessageListener): () => void {
-    this.listeners.push(listener);
-    return () => this.removeMessageListener(listener);
-  }
-  
-  /**
-   * Adds an analysis listener.
-   * @param listener Function to call for each analysis result.
-   * @returns Function to remove the listener.
-   */
-  addAnalysisListener(listener: AnalysisListener): () => void {
-    this.analysisListeners.push(listener);
-    return () => this.removeAnalysisListener(listener);
-  }
-  
-  /**
-   * Adds a bestmove listener.
-   * @param listener Function to call for each bestmove.
-   * @returns Function to remove the listener.
-   */
-  addBestMoveListener(listener: BestMoveListener): () => void {
-    this.bestMoveListeners.push(listener);
-    return () => this.removeBestMoveListener(listener);
-  }
-  
-  /**
-   * Removes a message listener.
-   * @param listener Listener to remove.
-   */
-  removeMessageListener(listener: MessageListener): void {
-    const index = this.listeners.indexOf(listener);
-    if (index !== -1) {
-      this.listeners.splice(index, 1);
-    }
-  }
-  
-  /**
-   * Removes an analysis listener.
-   * @param listener Listener to remove.
-   */
-  removeAnalysisListener(listener: AnalysisListener): void {
-    const index = this.analysisListeners.indexOf(listener);
-    if (index !== -1) {
-      this.analysisListeners.splice(index, 1);
-    }
-  }
-  
-  /**
-   * Removes a bestmove listener.
-   * @param listener Listener to remove.
-   */
-  removeBestMoveListener(listener: BestMoveListener): void {
-    const index = this.bestMoveListeners.indexOf(listener);
-    if (index !== -1) {
-      this.bestMoveListeners.splice(index, 1);
-    }
-  }
-  
-  /**
-   * Helper method to set position and start analysis.
-   * @param position Position in HUB format (WB notation).
-   * @param options Analysis options.
+   * Analyzes a position.
    */
   async analyzePosition(position: string, options: AnalysisOptions = {}): Promise<void> {
-    const { 
-      depth = 20, 
-      movetime, 
-      nodes,
-      infinite = false
-    } = options;
-    
-    await this.sendCommand('hub');
-    await this.sendCommand('init');
-    await this.sendCommand('new-game');
-    await this.sendCommand(`pos pos=${position}`);
-    
-    let levelCommands: string[] = [];
-    if (depth && !infinite) levelCommands.push(`level depth=${depth}`);
-    if (movetime) levelCommands.push(`level move-time=${movetime / 1000}`);
-    if (nodes) levelCommands.push(`level nodes=${nodes}`);
-    if (infinite) levelCommands.push('level infinite');
-    
-    for (const command of levelCommands) {
-      await this.sendCommand(command);
+    if (!position) {
+      throw new Error('Position is required');
     }
     
-    await this.sendCommand('go analyze');
+    try {
+      await ScanModule.analyzePosition(position, options);
+    } catch (error) {
+      throw new Error(`Failed to analyze position: ${error}`);
+    }
   }
   
   /**
-   * Helper method to stop ongoing analysis.
+   * Gets the best move for a position.
+   */
+  async getBestMove(position: string, options: SearchOptions = {}): Promise<string> {
+    if (!position) {
+      throw new Error('Position is required');
+    }
+    
+    return new Promise(async (resolve, reject) => {
+      // Set up one-time callback for the result
+      this.pendingMoveCallback = (data: BestMoveData) => {
+        if (data.move) {
+          resolve(data.move);
+        } else {
+          reject(new Error('No move returned from engine'));
+        }
+      };
+      
+      // Set timeout
+      const timeout = setTimeout(() => {
+        this.pendingMoveCallback = null;
+        reject(new Error('Timeout waiting for best move'));
+      }, (options.time || 10000) + 5000); // Add 5s buffer
+      
+      try {
+        await ScanModule.getBestMove(position, options);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingMoveCallback = null;
+        reject(error);
+      }
+    });
+  }
+  
+  /**
+   * Stops the current analysis.
    */
   async stopAnalysis(): Promise<void> {
-    await this.sendCommand('stop');
+    try {
+      await ScanModule.stopAnalysis();
+    } catch (error) {
+      throw new Error(`Failed to stop analysis: ${error}`);
+    }
   }
   
+  // Configuration methods
+  
   /**
-   * Helper method to get computer move in a game.
-   * @param position Position in HUB format.
-   * @param movetime Time in milliseconds for the move (default 1000ms).
-   * @param depth Analysis depth (default 15).
+   * Sets engine parameters.
    */
-  async getComputerMove(position: string, movetime: number = 1000, depth: number = 15): Promise<void> {
-    await this.sendCommand('hub');
-    await this.sendCommand('init');
-    await this.sendCommand(`pos pos=${position}`);
-    await this.sendCommand(`level move-time=${movetime / 1000}`);
-    await this.sendCommand(`level depth=${depth}`);
-    await this.sendCommand('go think');
+  async setParameters(params: ScanConfig): Promise<void> {
+    const paramMap: Record<string, any> = {};
+    
+    if (params.variant) paramMap['variant'] = params.variant;
+    if (params.book !== undefined) paramMap['book'] = params.book ? 'true' : 'false';
+    if (params.bookPly !== undefined) paramMap['book-ply'] = params.bookPly;
+    if (params.bookMargin !== undefined) paramMap['book-margin'] = params.bookMargin;
+    if (params.threads !== undefined) paramMap['threads'] = params.threads;
+    if (params.hashSize !== undefined) paramMap['tt-size'] = params.hashSize;
+    if (params.bitbaseSize !== undefined) paramMap['bb-size'] = params.bitbaseSize;
+    
+    if (Object.keys(paramMap).length > 0) {
+      try {
+        await ScanModule.setParameters(paramMap);
+      } catch (error) {
+        throw new Error(`Failed to set parameters: ${error}`);
+      }
+    }
   }
   
   /**
-   * Sets the engine variant (game rules).
-   * @param variant One of: normal, killer, bt, frisian, losing
+   * Sets the draughts variant.
    */
   async setVariant(variant: DraughtsVariant): Promise<void> {
-    await this.sendCommand(`set-param name=variant value=${variant}`);
+    await this.setParameters({ variant });
   }
   
   /**
    * Enables or disables the opening book.
-   * @param enabled Whether to use opening book
    */
   async setBook(enabled: boolean): Promise<void> {
-    await this.sendCommand(`set-param name=book value=${enabled ? 'true' : 'false'}`);
+    await this.setParameters({ book: enabled });
   }
   
   /**
-   * Sets the number of threads for search.
-   * @param threads Number of threads (1-16)
+   * Sets the number of threads.
    */
   async setThreads(threads: number): Promise<void> {
     const clampedThreads = Math.max(1, Math.min(16, threads));
-    await this.sendCommand(`set-param name=threads value=${clampedThreads}`);
+    await this.setParameters({ threads: clampedThreads });
   }
   
   /**
-   * Sets the transposition table size.
-   * @param size Size as power of 2 (16-30, represents 2^size entries)
+   * Sets the hash table size.
    */
   async setHashSize(size: number): Promise<void> {
     const clampedSize = Math.max(16, Math.min(30, size));
-    await this.sendCommand(`set-param name=tt-size value=${clampedSize}`);
+    await this.setParameters({ hashSize: clampedSize });
+  }
+  
+  // Convenience methods for common operations
+  
+  /**
+   * Sets up the engine for a new game.
+   */
+  async newGame(): Promise<void> {
+    await this.sendCommand('new-game');
   }
   
   /**
-   * Sets the bitbase size (endgame database size).
-   * @param size Maximum number of pieces for bitbase lookup (0-7)
+   * Sets a position from HUB format.
    */
-  async setBitbaseSize(size: number): Promise<void> {
-    const clampedSize = Math.max(0, Math.min(7, size));
-    await this.sendCommand(`set-param name=bb-size value=${clampedSize}`);
-  }
-  
-  /**
-   * Sets the opening book depth.
-   * @param ply Number of plies to use book (0-20)
-   */
-  async setBookPly(ply: number): Promise<void> {
-    const clampedPly = Math.max(0, Math.min(20, ply));
-    await this.sendCommand(`set-param name=book-ply value=${clampedPly}`);
-  }
-  
-  /**
-   * Sets the opening book margin.
-   * @param margin Book selection margin in centipawns (0-100)
-   */
-  async setBookMargin(margin: number): Promise<void> {
-    const clampedMargin = Math.max(0, Math.min(100, margin));
-    await this.sendCommand(`set-param name=book-margin value=${clampedMargin}`);
-  }
-  
-  /**
-   * Sets a position with moves applied.
-   * @param startPosition Starting position in HUB format
-   * @param moves Array of moves in HUB notation
-   */
-  async setPositionWithMoves(startPosition: string, moves: string[] = []): Promise<void> {
-    let command = `pos pos=${startPosition}`;
+  async setPosition(position: string, moves: string[] = []): Promise<void> {
+    let command = `pos pos=${position}`;
     if (moves.length > 0) {
       command += ` moves="${moves.join(' ')}"`;
     }
@@ -546,8 +486,7 @@ class Scan {
   }
   
   /**
-   * Sets a position from start with moves.
-   * @param moves Array of moves in HUB notation from starting position
+   * Sets a position from the starting position with moves.
    */
   async setPositionFromStart(moves: string[] = []): Promise<void> {
     let command = 'pos start';
@@ -558,211 +497,171 @@ class Scan {
   }
   
   /**
-   * Clears the transposition table and starts a new game.
-   */
-  async newGame(): Promise<void> {
-    await this.sendCommand('new-game');
-  }
-  
-  /**
-   * Pings the engine to check if it's responsive.
-   * @returns Promise that resolves when pong is received
+   * Pings the engine to check responsiveness.
    */
   async ping(): Promise<boolean> {
-    return new Promise((resolve) => {
-      const listener = this.addMessageListener((message) => {
-        if (message === 'pong') {
-          unsubscribe();
-          resolve(true);
-        }
-      });
-      
-      const unsubscribe = listener;
-      this.sendCommand('ping');
-      
-      // Timeout after 5 seconds
-      setTimeout(() => {
-        unsubscribe();
-        resolve(false);
-      }, 5000);
-    });
+    try {
+      await this.sendCommand('ping');
+      return true;
+    } catch (error) {
+      return false;
+    }
   }
   
+  // Event listener management
+  
   /**
-   * Gets engine information.
-   * @returns Promise that resolves with engine info
+   * Adds a message listener.
    */
-  async getEngineInfo(): Promise<AnalysisData | null> {
-    return new Promise((resolve) => {
-      const listener = this.addAnalysisListener((data) => {
-        if (data.type === 'id') {
-          unsubscribe();
-          resolve(data);
-        }
-      });
-      
-      const unsubscribe = listener;
-      this.sendCommand('hub');
-      
-      // Timeout after 5 seconds
-      setTimeout(() => {
-        unsubscribe();
-        resolve(null);
-      }, 5000);
-    });
+  addMessageListener(listener: MessageListener): () => void {
+    this.listeners.push(listener);
+    return () => this.removeMessageListener(listener);
   }
   
   /**
-   * Sets analysis level with various options.
-   * @param options Analysis level options
+   * Adds an analysis listener.
    */
-  async setLevel(options: {
-    depth?: number;
-    nodes?: number;
-    movetime?: number;
-    time?: number;
-    moves?: number;
-    inc?: number;
-    infinite?: boolean;
-    ponder?: boolean;
-  }): Promise<void> {
-    const commands: string[] = [];
-    
-    if (options.depth !== undefined) {
-      commands.push(`level depth=${options.depth}`);
-    }
-    if (options.nodes !== undefined) {
-      commands.push(`level nodes=${options.nodes}`);
-    }
-    if (options.movetime !== undefined) {
-      commands.push(`level move-time=${options.movetime}`);
-    }
-    if (options.time !== undefined) {
-      commands.push(`level time=${options.time}`);
-    }
-    if (options.moves !== undefined) {
-      commands.push(`level moves=${options.moves}`);
-    }
-    if (options.inc !== undefined) {
-      commands.push(`level inc=${options.inc}`);
-    }
-    if (options.infinite) {
-      commands.push('level infinite');
-    }
-    if (options.ponder) {
-      commands.push('level ponder');
-    }
-    
-    for (const command of commands) {
-      await this.sendCommand(command);
-    }
+  addAnalysisListener(listener: AnalysisListener): () => void {
+    this.analysisListeners.push(listener);
+    return () => this.removeAnalysisListener(listener);
   }
   
   /**
-   * Starts engine thinking (for move selection).
-   * @param options Optional thinking parameters
+   * Adds a bestmove listener.
    */
-  async startThinking(options: {
-    position?: string;
-    depth?: number;
-    movetime?: number;
-    ponder?: boolean;
-  } = {}): Promise<void> {
-    if (options.position) {
-      await this.sendCommand(`pos pos=${options.position}`);
+  addBestMoveListener(listener: BestMoveListener): () => void {
+    this.bestMoveListeners.push(listener);
+    return () => this.removeBestMoveListener(listener);
+  }
+  
+  /**
+   * Adds an error listener.
+   */
+  addErrorListener(listener: ErrorListener): () => void {
+    this.errorListeners.push(listener);
+    return () => this.removeErrorListener(listener);
+  }
+  
+  /**
+   * Adds a status listener.
+   */
+  addStatusListener(listener: StatusListener): () => void {
+    this.statusListeners.push(listener);
+    return () => this.removeStatusListener(listener);
+  }
+  
+  /**
+   * Removes a message listener.
+   */
+  removeMessageListener(listener: MessageListener): void {
+    const index = this.listeners.indexOf(listener);
+    if (index !== -1) {
+      this.listeners.splice(index, 1);
     }
-    
-    if (options.depth || options.movetime) {
-      await this.setLevel({
-        depth: options.depth,
-        movetime: options.movetime,
-        ponder: options.ponder
-      });
-    }
-    
-    if (options.ponder) {
-      await this.sendCommand('go ponder');
-    } else {
-      await this.sendCommand('go think');
+  }
+  
+  /**
+   * Removes an analysis listener.
+   */
+  removeAnalysisListener(listener: AnalysisListener): void {
+    const index = this.analysisListeners.indexOf(listener);
+    if (index !== -1) {
+      this.analysisListeners.splice(index, 1);
     }
   }
   
   /**
-   * Sends a ponder hit command (when pondered move is played).
+   * Removes a bestmove listener.
    */
-  async ponderHit(): Promise<void> {
-    await this.sendCommand('ponder-hit');
+  removeBestMoveListener(listener: BestMoveListener): void {
+    const index = this.bestMoveListeners.indexOf(listener);
+    if (index !== -1) {
+      this.bestMoveListeners.splice(index, 1);
+    }
   }
   
   /**
-   * Gets the last received best move.
-   * @returns Last best move data or null
+   * Removes an error listener.
    */
-  getLastBestMove(): BestMoveData | null {
-    return this.lastBestMove;
+  removeErrorListener(listener: ErrorListener): void {
+    const index = this.errorListeners.indexOf(listener);
+    if (index !== -1) {
+      this.errorListeners.splice(index, 1);
+    }
   }
   
   /**
-   * Checks if engine is initialized.
-   * @returns True if engine is initialized
+   * Removes a status listener.
    */
-  isInitialized(): boolean {
-    return this.engineInitialized;
+  removeStatusListener(listener: StatusListener): void {
+    const index = this.statusListeners.indexOf(listener);
+    if (index !== -1) {
+      this.statusListeners.splice(index, 1);
+    }
+  }
+  
+  // Property getters
+  
+  /**
+   * Gets the current status.
+   */
+  get status(): EngineStatus {
+    return this.currentStatus;
   }
   
   /**
-   * Gets current configuration.
-   * @returns Current configuration
+   * Checks if the engine is initialized.
    */
-  getConfig(): ScanConfig {
-    return { ...this.config };
+  get initialized(): boolean {
+    return this.isInitialized;
   }
   
   /**
-   * Cleans up resources when done with the library.
+   * Checks if the engine is started.
+   */
+  get started(): boolean {
+    return this.isStarted;
+  }
+  
+  /**
+   * Cleans up resources.
    */
   destroy(): void {
-    // Clear any pending throttle timers
-    if (this.messageThrottleTimer) {
-      clearTimeout(this.messageThrottleTimer);
-      this.messageThrottleTimer = null;
-    }
-    
-    if (this.analysisThrottleTimer) {
-      clearTimeout(this.analysisThrottleTimer);
-      this.analysisThrottleTimer = null;
-    }
-    
-    this.shutdown().catch(console.error);
-    
-    // Remove event subscriptions
+    // Clean up event subscriptions
     if (this.outputSubscription) {
       this.outputSubscription.remove();
     }
     if (this.analysisSubscription) {
       this.analysisSubscription.remove();
     }
+    if (this.errorSubscription) {
+      this.errorSubscription.remove();
+    }
+    if (this.statusSubscription) {
+      this.statusSubscription.remove();
+    }
+    if (this.appStateSubscription) {
+      this.appStateSubscription.remove();
+    }
     
     // Clear listeners
     this.listeners = [];
     this.analysisListeners = [];
     this.bestMoveListeners = [];
+    this.errorListeners = [];
+    this.statusListeners = [];
     
-    // Clear buffers
-    this.messageBuffer = [];
-    this.analysisBuffer = [];
-    this.lastBestMove = null;
+    // Shutdown engine
+    this.shutdown().catch(console.warn);
   }
 }
 
-// Export a single instance, but allow custom configuration
-export default new Scan();
+// Export the main class and create a default instance
+export default new ScanEngine();
 
-// Also export the class for users who want to create custom instances
-export { Scan };
 
 // Export useful constants
-export const STARTING_POSITION = 'W:W31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50:B1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20';
+export const STARTING_POSITION = 'Wbbbbbbbbbbbbbbbbbbbbeeeeeeeeeewwwwwwwwwwwwwwwwwwww';
 
 export const DRAUGHTS_VARIANTS: DraughtsVariant[] = [
   'normal',
@@ -773,12 +672,15 @@ export const DRAUGHTS_VARIANTS: DraughtsVariant[] = [
 ];
 
 // Export utility functions
-export const createScanInstance = (config?: Partial<ScanConfig>): Scan => {
-  return new Scan(config);
+export const createScanInstance = (): ScanEngine => {
+  return new ScanEngine();
 };
 
 export const parseMove = (move: string): { from: number; to: number; captures: number[] } | null => {
-  // Parse move format like "32-28" or "28x19x23"
+  if (!move || typeof move !== 'string') {
+    return null;
+  }
+  
   const isCapture = move.includes('x');
   
   if (!isCapture) {
@@ -814,4 +716,36 @@ export const formatMove = (from: number, to: number, captures: number[] = []): s
   } else {
     return `${from}x${captures.join('x')}x${to}`;
   }
+};
+
+export const isValidPosition = (position: string): boolean => {
+  if (!position || typeof position !== 'string') {
+    return false;
+  }
+  
+  // Basic validation for HUB format position
+  // Should be: side-to-move + 50 characters for board
+  if (position.length !== 51) {
+    return false;
+  }
+  
+  // First character should be W or B
+  const turn = position[0];
+  if (turn !== 'W' && turn !== 'B') {
+    return false;
+  }
+  
+  // Remaining characters should be w, b, W, B, or e
+  const boardChars = position.slice(1);
+  for (const char of boardChars) {
+    if (!'wbWBe'.includes(char)) {
+      return false;
+    }
+  }
+  
+  return true;
+};
+
+export const validateMove = (move: string): boolean => {
+  return parseMove(move) !== null;
 };

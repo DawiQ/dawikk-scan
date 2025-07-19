@@ -2,8 +2,8 @@
 //  RNScanModule.h
 //  dawikk-scan
 //
-//  React Native bridge for the Scan draughts engine
-//  Provides integration with the real Scan 3.1 engine by Fabien Letouzey
+//  Fixed React Native bridge for the Scan draughts engine
+//  Provides safe integration with proper threading and error handling
 //
 //  Created by dawikk-scan
 //  Copyright © 2024. All rights reserved.
@@ -17,62 +17,77 @@ NS_ASSUME_NONNULL_BEGIN
 /**
  * RNScanModule provides React Native integration with the Scan draughts engine.
  * 
- * This module bridges the powerful Scan engine (version 3.1) by Fabien Letouzey
- * with React Native applications, enabling real-time draughts analysis, game play,
- * and position evaluation.
+ * This module bridges the Scan engine (version 3.1) by Fabien Letouzey
+ * with React Native applications using proper threading and error handling.
  *
  * Key Features:
- * - Full HUB protocol support
+ * - Thread-safe HUB protocol support
  * - Real-time analysis and move generation
  * - Multiple draughts variants (Normal, Killer, BT, Frisian, Losing)
  * - Opening book support
  * - Endgame database integration
- * - Multi-threaded search
+ * - Proper error handling and recovery
  *
  * Events Emitted:
  * - 'scan-output': Raw output from the Scan engine
  * - 'scan-analyzed-output': Parsed analysis data including moves, scores, and engine info
+ * - 'scan-error': Error messages from the engine or bridge
+ * - 'scan-status': Engine status changes
  *
  * The module runs the Scan engine in a separate thread and communicates through
- * pipes to ensure non-blocking operation with the React Native JavaScript thread.
+ * a thread-safe message queue to ensure stability with React Native.
  */
 @interface RNScanModule : RCTEventEmitter <RCTBridgeModule>
 
 #pragma mark - Public Properties
 
 /**
- * Indicates whether the Scan engine is currently running.
- * @note This property is thread-safe and can be accessed from any thread.
+ * Indicates whether the Scan engine is currently initialized.
  */
-@property (nonatomic, readonly, getter=isEngineRunning) BOOL engineRunning;
+@property (nonatomic, readonly, getter=isEngineInitialized) BOOL engineInitialized;
 
 /**
- * Indicates whether the output listener thread is active.
- * @note This property is thread-safe and can be accessed from any thread.
+ * Indicates whether the Scan engine is ready to process commands.
  */
-@property (nonatomic, readonly, getter=isListenerRunning) BOOL listenerRunning;
+@property (nonatomic, readonly, getter=isEngineReady) BOOL engineReady;
 
 /**
- * Path to the Scan engine data files (books, evaluation, bitbases).
- * @note This is set during initialization and points to the ScanData bundle.
+ * Current engine status as a string.
+ */
+@property (nonatomic, readonly) NSString *engineStatus;
+
+/**
+ * Last error message from the engine.
+ */
+@property (nonatomic, readonly, nullable) NSString *lastError;
+
+/**
+ * Path to the Scan engine data files.
  */
 @property (nonatomic, readonly, nullable) NSString *dataPath;
 
 #pragma mark - Engine Lifecycle (Exported to React Native)
 
 /**
- * Initializes the Scan engine and starts background threads.
+ * Initializes the Scan engine.
  * @param resolve Promise resolver - called with @(YES) on success
  * @param reject Promise rejecter - called with error details on failure
  * 
  * This method:
  * 1. Sets up the data path to the ScanData bundle
  * 2. Initializes the C++ bridge
- * 3. Starts the engine thread running the HUB protocol
- * 4. Starts the output listener thread
+ * 3. Sets up message callbacks
  */
 - (void)initEngine:(RCTPromiseResolveBlock)resolve
           rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
+ * Starts the Scan engine thread.
+ * @param resolve Promise resolver - called with @(YES) on success
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)startEngine:(RCTPromiseResolveBlock)resolve
+           rejecter:(RCTPromiseRejectBlock)reject;
 
 /**
  * Sends a HUB protocol command to the Scan engine.
@@ -94,73 +109,107 @@ NS_ASSUME_NONNULL_BEGIN
            rejecter:(RCTPromiseRejectBlock)reject;
 
 /**
+ * Gets the current engine status.
+ * @param resolve Promise resolver - called with status string
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)getStatus:(RCTPromiseResolveBlock)resolve
+         rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
+ * Checks if the engine is ready to process commands.
+ * @param resolve Promise resolver - called with @(YES) if ready
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)isReady:(RCTPromiseResolveBlock)resolve
+       rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
+ * Waits for the engine to be ready with a timeout.
+ * @param timeout Timeout in seconds
+ * @param resolve Promise resolver - called with @(YES) if ready within timeout
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)waitReady:(NSNumber *)timeout
+         resolver:(RCTPromiseResolveBlock)resolve
+         rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
  * Shuts down the Scan engine and cleans up resources.
  * @param resolve Promise resolver - called with @(YES) on successful shutdown
  * @param reject Promise rejecter - called with error details on failure
- *
- * This method:
- * 1. Sends quit command to the engine
- * 2. Stops all background threads
- * 3. Cleans up the C++ bridge
- * 4. Releases all resources
  */
 - (void)shutdownEngine:(RCTPromiseResolveBlock)resolve
               rejecter:(RCTPromiseRejectBlock)reject;
 
-#pragma mark - Public Methods (Available to Native Code)
+#pragma mark - Convenience Methods (Exported to React Native)
+
+/**
+ * Analyzes a position with the given parameters.
+ * @param position Position string in HUB format
+ * @param options Analysis options dictionary (depth, time, etc.)
+ * @param resolve Promise resolver - called with @(YES) when analysis starts
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)analyzePosition:(NSString *)position
+                options:(NSDictionary *)options
+               resolver:(RCTPromiseResolveBlock)resolve
+               rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
+ * Gets the best move for a position.
+ * @param position Position string in HUB format
+ * @param options Search options dictionary (depth, time, etc.)
+ * @param resolve Promise resolver - called with move string
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)getBestMove:(NSString *)position
+            options:(NSDictionary *)options
+           resolver:(RCTPromiseResolveBlock)resolve
+           rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
+ * Stops the current analysis or search.
+ * @param resolve Promise resolver - called with @(YES) on success
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)stopAnalysis:(RCTPromiseResolveBlock)resolve
+            rejecter:(RCTPromiseRejectBlock)reject;
+
+/**
+ * Sets engine parameters.
+ * @param params Dictionary of parameter name-value pairs
+ * @param resolve Promise resolver - called with @(YES) on success
+ * @param reject Promise rejecter - called with error details on failure
+ */
+- (void)setParameters:(NSDictionary *)params
+             resolver:(RCTPromiseResolveBlock)resolve
+             rejecter:(RCTPromiseRejectBlock)reject;
+
+#pragma mark - Internal Methods
 
 /**
  * Sets up the data path for Scan engine files.
- * This method locates the ScanData bundle and sets the working directory.
- * Called automatically during initialization.
  */
 - (void)setupDataPath;
 
 /**
- * Processes raw output from the Scan engine and emits appropriate React Native events.
- * @param output Raw output string from the engine
- *
- * This method:
- * 1. Parses the HUB protocol output
- * 2. Emits 'scan-output' events with raw data
- * 3. Emits 'scan-analyzed-output' events with parsed data
+ * Processes a message from the engine.
+ * @param message Message string from the engine
  */
-- (void)processEngineOutput:(NSString *)output;
-
-#pragma mark - Output Processing Methods
+- (void)processEngineMessage:(NSString *)message;
 
 /**
- * Processes and emits engine identification information.
- * @param line HUB 'id' command response
+ * Emits a status change event.
+ * @param status New status string
  */
-- (void)sendEngineInfo:(NSString *)line;
+- (void)emitStatusChange:(NSString *)status;
 
 /**
- * Processes and emits engine parameter information.
- * @param line HUB 'param' command response  
+ * Emits an error event.
+ * @param error Error message
  */
-- (void)sendParameterInfo:(NSString *)line;
-
-/**
- * Processes and emits best move information.
- * @param line HUB 'done' command response with move data
- */
-- (void)sendBestMoveOutput:(NSString *)line;
-
-/**
- * Processes and emits analysis information.
- * @param line HUB 'info' command response with analysis data
- */
-- (void)sendAnalyzedOutput:(NSString *)line;
-
-/**
- * Parses HUB protocol key=value pairs into a dictionary.
- * @param line HUB protocol line to parse
- * @param dict Mutable dictionary to populate with parsed data
- *
- * Handles quoted values and multiple word values correctly.
- */
-- (void)parseHubLine:(NSString *)line intoDictionary:(NSMutableDictionary *)dict;
+- (void)emitError:(NSString *)error;
 
 @end
 
@@ -180,10 +229,31 @@ FOUNDATION_EXPORT NSString * const kScanVariantLosing;
  */
 FOUNDATION_EXPORT NSString * const kScanEventOutput;
 FOUNDATION_EXPORT NSString * const kScanEventAnalyzedOutput;
+FOUNDATION_EXPORT NSString * const kScanEventError;
+FOUNDATION_EXPORT NSString * const kScanEventStatus;
+
+/**
+ * Engine status constants
+ */
+FOUNDATION_EXPORT NSString * const kScanStatusStopped;
+FOUNDATION_EXPORT NSString * const kScanStatusInitializing;
+FOUNDATION_EXPORT NSString * const kScanStatusReady;
+FOUNDATION_EXPORT NSString * const kScanStatusThinking;
+FOUNDATION_EXPORT NSString * const kScanStatusError;
 
 /**
  * Standard starting position for international draughts
  */
 FOUNDATION_EXPORT NSString * const kScanStartingPosition;
+
+/**
+ * Common error codes
+ */
+FOUNDATION_EXPORT NSString * const kScanErrorInitFailed;
+FOUNDATION_EXPORT NSString * const kScanErrorNotInitialized;
+FOUNDATION_EXPORT NSString * const kScanErrorAlreadyRunning;
+FOUNDATION_EXPORT NSString * const kScanErrorInvalidCommand;
+FOUNDATION_EXPORT NSString * const kScanErrorEngineError;
+FOUNDATION_EXPORT NSString * const kScanErrorTimeout;
 
 NS_ASSUME_NONNULL_END
